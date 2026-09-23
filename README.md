@@ -11,7 +11,7 @@ claude.ai, the Claude API, and any other agent that implements the spec.
 
 | Skill | What it does |
 | --- | --- |
-| _none yet_ | |
+| [google-developer-style](skills/google-developer-style/) | Rewrites all prose (replies, plans, commit messages, comments, docstrings, READMEs) to follow the Google developer documentation style guide: literal, second-person, active-voice, present-tense English with no figurative language or filler. |
 
 ## Layout
 
