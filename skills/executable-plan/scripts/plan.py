@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pyyaml>=6.0"]
+# dependencies = ["ruamel.yaml>=0.18"]
 # ///
 """Operate on an executable plan's graph.yaml.
 
@@ -11,27 +11,32 @@ Usage:
     uv run plan.py next GRAPH                  # what can start now, and why the rest waits
     uv run plan.py set GRAPH ID key=value ...  # status=, lane=, branch=, commit=, log=, answer=N:text
     uv run plan.py render GRAPH                # a status table (Markdown)
-    uv run plan.py lane GRAPH ID open|integrate|close|abandon   # print the shell commands for the lane
+    uv run plan.py lane GRAPH ID ACTION        # print the shell command for a lane action:
+                                               #   open, integrate, close, abandon, discard
     uv run plan.py excerpt GRAPH ID            # the task's section from the plan document
 
 The script runs only read-only git commands. It prints every command that
-changes a repository for the coordinator to run, so each destructive step
-stays visible.
+changes a repository for the coordinator to run, as one `&&` chain that
+stops at the first failure, so each destructive step stays visible.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import html as html_lib
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
 
-import yaml
+from ruamel.yaml import YAML
 
 STATUSES = ("planned", "running", "review", "integrating", "done", "blocked", "skipped")
 OPEN_STATUSES = ("running", "review", "integrating")
@@ -49,24 +54,60 @@ MODEL_STAGES = ("implement", "review", "fix", "final_review")
 CHAIN_AGENTS = {"default": 4, "docs-only": 2, "measurement": 1, "none": 0}
 SELF = Path(__file__).resolve()
 
+_yaml = YAML()  # round-trip mode: keeps the comments, quotes, and layout the drafter wrote
+_yaml.preserve_quotes = True  # an unquoted `yes` is a boolean to YAML 1.1 readers
+_yaml.width = 4096  # never fold a long log line
+_yaml.indent(mapping=2, sequence=4, offset=2)
 
-# ── loading ────────────────────────────────────────────────────────────────────
+
+# ── loading and saving ─────────────────────────────────────────────────────────
 
 def load(graph_path: Path) -> dict:
-    with graph_path.open(encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
-    data.setdefault("plan", {})
-    data.setdefault("nodes", [])
+    data = _yaml.load(graph_path.read_text(encoding="utf-8"))
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise SystemExit(f"{graph_path} must be a map with `plan` and `nodes`")
+    if data.get("plan") is None:
+        data["plan"] = {}
+    if data.get("nodes") is None:
+        data["nodes"] = []
     return data
 
 
+def dump(data: dict) -> str:
+    buf = StringIO()
+    _yaml.dump(data, buf)
+    return buf.getvalue()
+
+
 def save(graph_path: Path, data: dict) -> None:
-    with graph_path.open("w", encoding="utf-8") as fh:
-        yaml.safe_dump(data, fh, sort_keys=False, allow_unicode=True, width=100)
+    """Write atomically, so a reader never sees half a file."""
+    fd, tmp = tempfile.mkstemp(dir=graph_path.parent, prefix=f".{graph_path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(dump(data))
+        os.replace(tmp, graph_path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def locked(graph_path: Path):
+    """Serialize read-modify-write of the graph across processes."""
+    common = _git("-C", str(graph_path.parent), "rev-parse", "--git-common-dir")
+    if common:
+        lock = (graph_path.parent / common / "executable-plan.lock").resolve()
+    else:
+        lock = graph_path.with_name(f".{graph_path.name}.lock")
+    with open(lock, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
 
 
 def by_id(data: dict) -> dict[str, dict]:
-    return {n.get("id"): n for n in data["nodes"] if isinstance(n, dict)}
+    return {n["id"]: n for n in data["nodes"] if isinstance(n, dict) and isinstance(n.get("id"), str)}
 
 
 def chain_of(node: dict) -> str:
@@ -75,91 +116,122 @@ def chain_of(node: dict) -> str:
     return {"docs": "docs-only", "plan": "docs-only", "measurement": "measurement"}.get(node.get("kind"), "default")
 
 
+def runs_alone(node: dict) -> bool:
+    # A measurement runs alone unless told otherwise: other lanes' builds skew its numbers.
+    return bool(node.get("alone", node.get("kind") == "measurement"))
+
+
 def spec_target(node: dict, data: dict, graph_path: Path) -> tuple[Path, str]:
     """Resolve a node's `spec` to (document path, anchor)."""
     spec = str(node.get("spec", ""))
     doc, _, anchor = spec.partition("#")
-    base = graph_path.parent
-    path = base / (doc or str(data["plan"].get("spec", "")))
+    path = graph_path.parent / (doc or str(data["plan"].get("spec", "")))
     return path, anchor
+
+
+def root_dir(plan: dict, key: str, graph_path: Path) -> Path:
+    """A directory setting, with `~` expanded and a relative path taken from graph.yaml's directory."""
+    path = Path(os.path.expanduser(str(plan[key])))
+    return (path if path.is_absolute() else graph_path.parent / path).resolve()
 
 
 # ── anchors and excerpts ───────────────────────────────────────────────────────
 
-HEADING_RE = re.compile(r"^(#{1,6})(?:[ \t]|$)")
+class AnchorError(Exception):
+    pass
+
+
+HEADING_RE = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]|$)")
+SETEXT_RE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+MARKER_RE = re.compile(r"^<!--\s*task:\s*(\S+?)\s*-->$")
 
 
 def _slug(text: str) -> str:
-    text = re.sub(r"[^\w\s-]", "", text.strip().lower())
+    text = re.sub(r"\{#[^}]*\}", "", text)
+    text = re.sub(r"[^\w\s-]", "", text.strip().strip("#").strip().lower())
     return re.sub(r"[\s_]+", "-", text)
 
 
-def _md_headings(lines: list[str]) -> list[tuple[int, int]]:
-    """(line index, level) of each ATX heading outside a fenced code block.
+def _md_scan(lines: list[str]) -> tuple[dict[int, int], list[tuple[int, str]], list[bool]]:
+    """Headings {line: level}, task markers [(line, id)], and which lines are live.
 
-    A `#` line inside a fence (a shell comment, a Rust `#[attribute]`) is not
-    a heading, so it must never end a task's section.
+    A line inside a fenced code block or a multi-line HTML comment is not live:
+    it is never a heading or a marker, so a code sample or a commented-out
+    draft can't end a task's section or claim its anchor.
     """
-    out: list[tuple[int, int]] = []
+    headings: dict[int, int] = {}
+    markers: list[tuple[int, str]] = []
+    live = [False] * len(lines)
     fence: str | None = None
+    comment = False
     for i, line in enumerate(lines):
-        if m := FENCE_RE.match(line):
-            marker = m.group(1)
-            if fence is None:
-                fence = marker
-            elif marker[0] == fence[0] and len(marker) >= len(fence):
+        if fence is not None:
+            m = FENCE_RE.match(line)
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                    and not line.strip()[len(m.group(1)):].strip():
                 fence = None
             continue
-        if fence is None and (h := HEADING_RE.match(line)):
-            out.append((i, len(h.group(1))))
-    return out
-
-
-def _md_section(text: str, anchor: str) -> tuple[int, int, list[str]] | None:
-    """The line range [start, end) of the Markdown section that `anchor` names."""
-    lines = text.splitlines()
-    headings = _md_headings(lines)
-    heading_at = dict(headings)
-    link = re.compile(rf"""<a\s+(?:name|id)\s*=\s*["']{re.escape(anchor)}["']""")
-    mark = None
-    for i, line in enumerate(lines):
+        if comment:
+            if "-->" in line:
+                comment = False
+            continue
+        if m := FENCE_RE.match(line):
+            fence = m.group(1)
+            continue
         stripped = line.strip()
-        if stripped == f"<!-- task: {anchor} -->" or link.search(line):
-            mark = i
-            break
-        if i in heading_at and (f"{{#{anchor}}}" in line or _slug(line.lstrip("#")) == anchor):
-            mark = i
-            break
-    if mark is None:
-        return None
-    before = [(i, lvl) for i, lvl in headings if i <= mark]
-    if not before:
-        return None
-    start, level = before[-1]
-    end = next((i for i, lvl in headings if i > start and lvl <= level), len(lines))
-    return start, end, lines
+        if mm := MARKER_RE.match(stripped):
+            markers.append((i, mm.group(1)))
+            continue
+        if "<!--" in line and "-->" not in line.split("<!--", 1)[1]:
+            comment = True
+            continue
+        live[i] = True
+        if h := HEADING_RE.match(line):
+            headings[i] = len(h.group(1))
+        elif SETEXT_RE.match(line) and i > 0 and live[i - 1] and lines[i - 1].strip() \
+                and (i - 1) not in headings and not HEADING_RE.match(lines[i - 1]):
+            headings[i - 1] = 1 if stripped.startswith("=") else 2
+    return headings, markers, live
 
 
-def _html_section(text: str, anchor: str) -> tuple[int, int] | None:
-    """The character range of the HTML section whose heading carries id=anchor."""
-    m = re.search(rf"""<h([1-6])\b[^>]*?\sid\s*=\s*["']{re.escape(anchor)}["'][^>]*>""", text, re.I)
-    if not m:
-        return None
-    level = int(m.group(1))
-    end = re.compile(rf"<h[1-{level}]\b", re.I).search(text, m.end())
-    return m.start(), end.start() if end else len(text)
-
-
-def _is_html(doc: Path) -> bool:
-    return doc.suffix.lower() in (".html", ".htm")
-
-
-def anchor_exists(doc: Path, anchor: str) -> bool:
-    if not doc.is_file() or not anchor:
-        return False
-    text = doc.read_text(encoding="utf-8")
-    return (_html_section(text, anchor) if _is_html(doc) else _md_section(text, anchor)) is not None
+def _md_section(text: str, anchor: str) -> str:
+    lines = text.splitlines()
+    headings, markers, live = _md_scan(lines)
+    hits = [i for i, a in markers if a == anchor]
+    if len(hits) > 1:
+        raise AnchorError(f"the marker <!-- task: {anchor} --> appears {len(hits)} times")
+    if hits:
+        prev = hits[0] - 1
+        while prev >= 0 and not lines[prev].strip():
+            prev -= 1
+        if prev in headings:
+            start = prev
+        elif prev - 1 in headings and SETEXT_RE.match(lines[prev]):
+            start = prev - 1
+        else:
+            raise AnchorError(f"the marker <!-- task: {anchor} --> is not directly after a heading")
+    else:
+        link = re.compile(rf"""<a\s+(?:name|id)\s*=\s*["']{re.escape(anchor)}["']""")
+        rules = (
+            ("a {#id} heading", [i for i in headings if f"{{#{anchor}}}" in lines[i]]),
+            ("an <a id> anchor", [i for i in range(len(lines)) if live[i] and link.search(lines[i])]),
+            ("a heading slug", [i for i in headings if _slug(lines[i]) == anchor]),
+        )
+        for what, found in rules:
+            if len(found) > 1:
+                raise AnchorError(f"{what} for {anchor!r} matches {len(found)} places; add a task marker")
+            if found:
+                before = [i for i in headings if i <= found[0]]
+                if not before:
+                    raise AnchorError(f"{what} for {anchor!r} is not under a heading")
+                start = max(before)
+                break
+        else:
+            raise AnchorError(f"no section for task {anchor!r}")
+    level = headings[start]
+    end = next((j for j in sorted(headings) if j > start and headings[j] <= level), len(lines))
+    return "\n".join(lines[start:end]).strip()
 
 
 def _strip_html(fragment: str) -> str:
@@ -174,18 +246,29 @@ def _strip_html(fragment: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def excerpt(doc: Path, anchor: str) -> str:
+def _html_section(text: str, anchor: str) -> str:
+    clean = re.sub(r"(?s)<!--.*?-->", "", text)
+    id_attr = rf"""\sid\s*=\s*["']{re.escape(anchor)}["']"""  # ids are case-sensitive
+    everywhere = re.findall(rf"<[A-Za-z][^>]*?{id_attr}", clean)
+    if len(everywhere) > 1:
+        raise AnchorError(f'id="{anchor}" appears {len(everywhere)} times')
+    m = re.search(rf"<(?i:h)([1-6])\b[^>]*?{id_attr}[^>]*>", clean)
+    if not m:
+        where = " (it is on an element that is not a heading)" if everywhere else ""
+        raise AnchorError(f'no heading with id="{anchor}"{where}')
+    level = int(m.group(1))
+    end = re.compile(rf"<h[1-{level}]\b", re.I).search(clean, m.end())
+    return _strip_html(clean[m.start(): end.start() if end else len(clean)])
+
+
+def section(doc: Path, anchor: str) -> str:
+    """The task's section; raises AnchorError when the anchor is missing or ambiguous."""
+    if not anchor:
+        raise AnchorError("the spec has no #anchor")
     text = doc.read_text(encoding="utf-8")
-    if _is_html(doc):
-        span = _html_section(text, anchor)
-        if span is None:
-            raise SystemExit(f"no heading with id=\"{anchor}\" in {doc}")
-        return _strip_html(text[span[0]:span[1]])
-    section = _md_section(text, anchor)
-    if section is None:
-        raise SystemExit(f"no section for task {anchor!r} in {doc}")
-    start, end, lines = section
-    return "\n".join(lines[start:end]).strip()
+    if doc.suffix.lower() in (".html", ".htm"):
+        return _html_section(text, anchor)
+    return _md_section(text, anchor)
 
 
 # ── validation ─────────────────────────────────────────────────────────────────
@@ -194,13 +277,17 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
     plan = data["plan"]
+    if not isinstance(plan, dict):
+        return ["`plan` must be a map"], warnings
+    if not isinstance(data["nodes"], list):
+        return ["`nodes` must be a list"], warnings
     for key in PLAN_REQUIRED:
         if key not in plan:
             errors.append(f"plan.{key} is missing")
     lane_cap = plan.get("lane_cap", 1)
     if isinstance(lane_cap, bool) or not isinstance(lane_cap, int) or lane_cap < 1:
         errors.append("plan.lane_cap must be an integer >= 1")
-    if plan.get("autonomy") not in (0, 1, 2, 3, 4):
+    if plan.get("autonomy") not in (0, 1, 2, 3, 4) or isinstance(plan.get("autonomy"), bool):
         errors.append("plan.autonomy must be an integer from 0 to 4")
     if plan.get("commit_policy") not in ("keep", "squash"):
         errors.append("plan.commit_policy must be 'keep' or 'squash'")
@@ -208,24 +295,39 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
     for stage in MODEL_STAGES:
         if not models.get(stage):
             errors.append(f"plan.models.{stage} is missing")
-    if not isinstance(plan.get("gates"), list) or not plan.get("gates"):
+    gates = plan.get("gates")
+    if not isinstance(gates, list) or not gates:
         errors.append("plan.gates must be a non-empty list of commands")
+    elif any(not isinstance(g, str) for g in gates):
+        errors.append("plan.gates: every gate must be a string; quote a command that contains `: `")
     spec_doc = graph_path.parent / str(plan.get("spec", ""))
     if not spec_doc.is_file():
         errors.append(f"plan.spec does not exist: {spec_doc}")
     for rel in plan.get("guidelines") or []:
-        if not (graph_path.parent / rel).exists() and not Path(rel).expanduser().exists():
+        if not (graph_path.parent / str(rel)).exists() and not Path(str(rel)).expanduser().exists():
             warnings.append(f"guideline file not found: {rel}")
+    if "worktree_root" in plan:
+        wt_root = root_dir(plan, "worktree_root", graph_path)
+        repo = repo_root(graph_path)
+        if wt_root.is_relative_to(repo):
+            warnings.append(f"worktree_root is inside the repository; add "
+                            f"{wt_root.relative_to(repo)}/ to .git/info/exclude so lanes don't show as untracked files")
 
     nodes = data["nodes"]
+    if any(not isinstance(n, dict) for n in nodes):
+        return errors + ["every item of `nodes` must be a map"], warnings
     ids = [n.get("id") for n in nodes]
-    dupes = {i for i in ids if ids.count(i) > 1}
-    for d in dupes:
+    for n in nodes:
+        if not isinstance(n.get("id"), str):
+            errors.append(f"id {n.get('id')!r} must be a string; quote it in graph.yaml")
+    str_ids = [i for i in ids if isinstance(i, str)]
+    for d in sorted({i for i in str_ids if str_ids.count(i) > 1}):
         errors.append(f"duplicate node id: {d}")
-    known = set(ids)
+    known = set(str_ids)
+    specs: dict[tuple[str, str], str] = {}
     for n in nodes:
         nid = str(n.get("id", "?"))
-        if not ID_RE.match(nid):
+        if isinstance(n.get("id"), str) and not ID_RE.match(nid):
             errors.append(f"{nid}: id must match {ID_RE.pattern}")
         for key in ("title", "spec", "kind", "size", "status"):
             if key not in n:
@@ -239,34 +341,44 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
         if n.get("status") not in STATUSES:
             errors.append(f"{nid}: status must be one of {STATUSES}")
         lists_ok = True
-        for key in ("deps", "soft_deps", "files"):
-            if n.get(key) is not None and not isinstance(n.get(key), list):
+        for key in ("deps", "soft_deps", "files", "owner_decisions"):
+            value = n.get(key)
+            if value is not None and not isinstance(value, list):
                 errors.append(f"{nid}: {key} must be a list")
                 lists_ok = False
         if lists_ok:
             for dep in (n.get("deps") or []) + (n.get("soft_deps") or []):
-                if dep not in known:
+                if not isinstance(dep, str):
+                    errors.append(f"{nid}: dependency {dep!r} must be a string; quote it")
+                elif dep not in known:
                     errors.append(f"{nid}: unknown dependency {dep}")
-                if dep == nid:
+                elif dep == nid:
                     errors.append(f"{nid}: depends on itself")
+            for od in n.get("owner_decisions") or []:
+                if not isinstance(od, dict) or "question" not in od or "default" not in od:
+                    errors.append(f"{nid}: each owner_decisions item needs `question` and `default`")
         if n.get("kind") == "code" and not n.get("files"):
             warnings.append(f"{nid}: a code task with no `files` cannot be excluded from a conflicting lane")
-        for od in n.get("owner_decisions") or []:
-            if not isinstance(od, dict) or "question" not in od or "default" not in od:
-                errors.append(f"{nid}: each owner_decisions item needs `question` and `default`")
         if "spec" in n:
             doc, anchor = spec_target(n, data, graph_path)
+            key = (str(doc.resolve()), anchor)
+            if key in specs:
+                errors.append(f"{nid}: same spec as {specs[key]}")
+            specs[key] = nid
             if not doc.is_file():
                 errors.append(f"{nid}: spec document not found: {doc}")
-            elif not anchor_exists(doc, anchor):
-                errors.append(f"{nid}: anchor #{anchor} not found in {doc.name}")
+            else:
+                try:
+                    section(doc, anchor)
+                except AnchorError as exc:
+                    errors.append(f"{nid}: {exc} in {doc.name}")
     if not errors and (cycle := find_cycle(data)):
         errors.append("dependency cycle: " + " -> ".join(cycle))
     return errors, warnings
 
 
 def find_cycle(data: dict) -> list[str] | None:
-    graph = {n["id"]: list(n.get("deps") or []) for n in data["nodes"] if "id" in n}
+    graph = {i: list(n.get("deps") or []) for i, n in by_id(data).items()}
     state: dict[str, int] = {}
     stack: list[str] = []
 
@@ -306,44 +418,65 @@ def waves(data: dict) -> list[list[str]]:
 
 
 def next_ready(data: dict) -> tuple[list[dict], list[tuple[str, str]], int]:
+    """(tasks to start now, [(held task, reason)], free slots)."""
     plan = data["plan"]
     nodes = by_id(data)
     done = {i for i, n in nodes.items() if n.get("status") in FINISHED_STATUSES}
     blocked = {i for i, n in nodes.items() if n.get("status") == "blocked"}
     running = [n for n in nodes.values() if n.get("status") in OPEN_STATUSES]
-    running_files = {f for n in running for f in (n.get("files") or [])}
+    running_ids = {n["id"] for n in running}
     slots = int(plan.get("lane_cap", 1)) - len(running)
-    start: list[dict] = []
     hold: list[tuple[str, str]] = []
-    candidates = [n for n in nodes.values() if n.get("status") == "planned"]
-    if any(n.get("alone") for n in running):
-        return [], [(n["id"], "an `alone` lane is running") for n in candidates], slots
+
     # Prefer tasks whose soft deps are done, then larger tasks (they gate more), then id order.
     def rank(n: dict) -> tuple:
         soft_open = sum(1 for d in n.get("soft_deps") or [] if d not in done)
         return (soft_open, -{"L": 3, "M": 2, "S": 1}.get(n.get("size"), 1), n["id"])
-    for n in sorted(candidates, key=rank):
-        nid = n["id"]
+
+    eligible: list[dict] = []
+    for n in sorted((n for n in nodes.values() if n.get("status") == "planned"), key=rank):
         missing = [d for d in n.get("deps") or [] if d not in done]
         if missing:
             labels = [f"{d} (blocked)" if d in blocked else d for d in missing]
-            hold.append((nid, "waits for " + ", ".join(labels)))
-            continue
-        if n.get("alone") and (running or start):
-            hold.append((nid, "runs alone; lanes are open"))
-            continue
-        shared = sorted(set(n.get("files") or []) & (running_files | {f for s in start for f in (s.get("files") or [])}))
-        if shared:
-            hold.append((nid, "shares files with an open lane: " + ", ".join(shared[:3]) + (" ..." if len(shared) > 3 else "")))
+            hold.append((n["id"], "waits for " + ", ".join(labels)))
             continue
         unanswered = [od for od in n.get("owner_decisions") or [] if not str(od.get("answer") or "").strip()]
         if unanswered and int(plan.get("autonomy", 2)) < 4:
-            hold.append((nid, f"needs the owner's answer: {unanswered[0]['question']}"))
+            hold.append((n["id"], f"needs the owner's answer: {unanswered[0]['question']}"))
+            continue
+        eligible.append(n)
+
+    # A task that runs alone starts only when no lane is open, and once one is
+    # eligible nothing else starts before it, so the open lanes drain for it.
+    alone_open = next((n for n in running if runs_alone(n)), None)
+    if alone_open is not None:
+        return [], hold + [(n["id"], f"`{alone_open['id']}` runs alone") for n in eligible], slots
+    alone = next((n for n in eligible if runs_alone(n)), None)
+    if alone is not None:
+        others = [n for n in eligible if n is not alone]
+        if running:
+            hold.append((alone["id"], f"runs alone; waits for {len(running)} open lane(s) to close"))
+            return [], hold + [(n["id"], f"held so the open lanes drain for `{alone['id']}`") for n in others], slots
+        return [alone], hold + [(n["id"], f"`{alone['id']}` runs alone") for n in others], slots
+
+    start: list[dict] = []
+    taken = {f for n in running for f in (n.get("files") or [])}
+    for n in eligible:
+        shared = sorted(set(n.get("files") or []) & taken)
+        if shared:
+            hold.append((n["id"], "shares files with an open lane: " + ", ".join(shared[:3]) + (" ..." if len(shared) > 3 else "")))
+            continue
+        # A soft dependency orders work: the task waits while one is running or
+        # starting, but not for one that can't start yet.
+        busy = [d for d in n.get("soft_deps") or [] if d in running_ids or d in {s["id"] for s in start}]
+        if busy:
+            hold.append((n["id"], "starts after its soft dependencies: " + ", ".join(busy)))
             continue
         if len(start) >= max(slots, 0):
-            hold.append((nid, "no free lane slot"))
+            hold.append((n["id"], "no free lane slot"))
             continue
         start.append(n)
+        taken |= set(n.get("files") or [])
     return start, hold, slots
 
 
@@ -368,16 +501,17 @@ def set_fields(data: dict, nid: str, assignments: list[str]) -> None:
         elif key == "answer":
             idx, _, text = value.partition(":")
             decisions = n.get("owner_decisions") or []
-            try:
-                decisions[int(idx)]["answer"] = text
-            except (ValueError, IndexError):
-                raise SystemExit(f"no owner decision at index {idx!r}")
+            if not idx.isdigit() or int(idx) >= len(decisions):
+                raise SystemExit(f"no owner decision at index {idx!r}; {nid} has {len(decisions)} (counted from 0)")
+            decisions[int(idx)]["answer"] = text
         elif key == "log":
             pass  # the text lands in the log line below
         else:
             raise SystemExit(f"unknown key {key!r}; use status, lane, branch, commit, answer, log")
         changed.append(a)
-    n.setdefault("log", []).append(f"{datetime.now().isoformat(timespec='minutes')} {' '.join(changed)}")
+    if "log" not in n or n["log"] is None:
+        n["log"] = []
+    n["log"].append(f"{datetime.now().isoformat(timespec='minutes')} {' '.join(changed)}")
 
 
 # ── rendering ──────────────────────────────────────────────────────────────────
@@ -410,20 +544,49 @@ def _git(*args: str) -> str | None:
 
 def repo_root(graph_path: Path) -> Path:
     root = _git("-C", str(graph_path.parent), "rev-parse", "--show-toplevel")
-    return Path(root) if root else graph_path.parent
+    return Path(root).resolve() if root else graph_path.parent
+
+
+def rebase_in_progress(wt: Path) -> bool:
+    for name in ("rebase-merge", "rebase-apply"):
+        p = _git("-C", str(wt), "rev-parse", "--git-path", name)
+        if p and (wt / p).exists():
+            return True
+    return False
+
+
+def landed_commit(root: Path, nid: str, branch: str, main: str, policy: str) -> str | None:
+    """The integration commit if an earlier integration already merged the lane."""
+    if policy == "squash":
+        return _git("-C", str(root), "log", main, "-1", "--format=%h", "--extended-regexp",
+                    f"--grep=^Plan-Task: {re.escape(nid)}$") or None
+    subject = _git("-C", str(root), "log", "-1", "--format=%s", branch) or ""
+    ancestor = subprocess.run(["git", "-C", str(root), "merge-base", "--is-ancestor", branch, main],
+                              capture_output=True).returncode == 0
+    if ancestor and subject.startswith(f"{nid}: "):
+        return _git("-C", str(root), "rev-parse", "--short", branch)
+    return None
 
 
 def check_integrable(root: Path, wt: Path, branch: str, main: str) -> None:
-    """Refuse to print integration steps for a lane that would land nothing."""
+    """Refuse to print integration steps for a lane that would land nothing or the wrong thing."""
     if not wt.is_dir():
         raise SystemExit(f"refused: the lane worktree {wt} does not exist")
+    if rebase_in_progress(wt):
+        raise SystemExit(
+            f"refused: a rebase is in progress in {wt}. Resolve the conflict and run "
+            f"`git -C {wt} rebase --continue`, or run `git -C {wt} rebase --abort`; then integrate again")
+    on = _git("-C", str(wt), "symbolic-ref", "--short", "HEAD")
+    if on != branch:
+        raise SystemExit(f"refused: the lane worktree is on {on or 'a detached HEAD'}, not {branch}")
     dirty = _git("-C", str(wt), "status", "--porcelain")
     if dirty is None:
         raise SystemExit(f"refused: git status failed in {wt}")
     if dirty:
         raise SystemExit(
-            f"refused: the lane has uncommitted changes. The chain's last stage commits its work "
-            f"(see references/chain.md); commit or discard these first:\n{dirty}")
+            f"refused: the lane has uncommitted changes. Every chain stage ends with a commit "
+            f"(see references/chain.md); commit or discard these first. If they are build output, "
+            f"add their pattern to .git/info/exclude:\n{dirty}")
     ahead = _git("-C", str(root), "rev-list", "--count", f"{main}..{branch}")
     if ahead is None:
         raise SystemExit(f"refused: cannot compare {branch} with {main}")
@@ -434,66 +597,113 @@ def check_integrable(root: Path, wt: Path, branch: str, main: str) -> None:
         raise SystemExit(f"refused: the main worktree {root} is on {current or 'a detached HEAD'}, not {main}")
 
 
+def _chain(lines: list[str], steps: list[str]) -> list[str]:
+    return lines + [" && \\\n".join(steps)]
+
+
 def lane_commands(data: dict, graph_path: Path, nid: str, action: str) -> str:
     plan = data["plan"]
     n = by_id(data).get(nid)
     if n is None:
         raise SystemExit(f"unknown node id: {nid}")
     root = repo_root(graph_path)
-    wt = Path(os.path.expanduser(str(plan["worktree_root"]))) / nid
-    scratch = Path(os.path.expanduser(str(plan["scratch_root"]))) / nid
+    wt = root_dir(plan, "worktree_root", graph_path) / nid
+    scratch = root_dir(plan, "scratch_root", graph_path) / nid
     branch = f"{plan['branch_prefix']}{nid}"
     main = str(plan["integration_branch"])
+    policy = str(plan.get("commit_policy"))
     q = shlex.quote
     me = f"uv run {q(str(SELF))}"
     graph = q(str(graph_path))
-    lines: list[str] = [f"# lane {nid}: {action}"]
+    lines: list[str] = [f"# lane {nid}: {action}. Run the command below as one command; it stops at the first failure."]
     if action == "open":
-        lines += [
+        if n.get("status") != "planned":
+            raise SystemExit(f"refused: {nid} is {n.get('status')}, not planned")
+        return "\n".join(_chain(lines, [
             f"git -C {q(str(root))} worktree add {q(str(wt))} -b {q(branch)} {q(main)}",
             f"mkdir -p {q(str(scratch))}",
             f"{me} set {graph} {q(nid)} status=running lane={q(str(wt))} branch={q(branch)}",
-        ]
-    elif action == "integrate":
+        ]))
+    if action == "integrate":
+        landed = landed_commit(root, nid, branch, main, policy)
+        if landed:
+            lines += [f"# {branch} already landed on {main} at {landed}: an earlier integration stopped after the merge."]
+            return "\n".join(_chain(lines, [f"{me} set {graph} {q(nid)} status=done commit={landed}"]))
         check_integrable(root, wt, branch, main)
-        lines += [f"git -C {q(str(wt))} rebase {q(main)}"]
-        lines += [f"(cd {q(str(wt))} && {gate})" for gate in plan.get("gates") or []]
-        if plan.get("commit_policy") == "squash":
-            lines += [
+        changed = (_git("-C", str(root), "diff", "--name-only", f"{main}...{branch}") or "").splitlines()
+        unlisted = sorted(set(changed) - set(n.get("files") or []))
+        if unlisted:
+            lines += [f"# note: the lane changed files that `files` does not list: {', '.join(unlisted)}",
+                      "# add them to the task's `files` so the exclusion rule holds for the tasks still to run"]
+        steps = [f"git -C {q(str(wt))} rebase {q(main)}"]
+        steps += [f"(cd {q(str(wt))} && {gate})" for gate in plan.get("gates") or []]
+        if policy == "squash":
+            steps += [
                 f"git -C {q(str(root))} merge --squash {q(branch)}",
-                f"git -C {q(str(root))} commit  # one message that names the task and what it changed",
+                f"git -C {q(str(root))} commit -m {q(f'{nid}: {n.get('title', '')}')} -m {q(f'Plan-Task: {nid}')}",
             ]
         else:
-            lines += [f"git -C {q(str(root))} merge --ff-only {q(branch)}"]
-        lines += [
-            "# then: apply the task's as-landed text to the plan document, and",
-            f"{me} set {graph} {q(nid)} status=done commit=$(git -C {q(str(root))} rev-parse --short HEAD)",
-            "# then commit the plan document and graph.yaml on the integration branch, and close the lane",
-        ]
-    elif action == "close":
+            steps += [f"git -C {q(str(root))} merge --ff-only {q(branch)}"]
+        steps += [f"{me} set {graph} {q(nid)} status=done commit=$(git -C {q(str(root))} rev-parse --short HEAD)"]
+        lines = _chain(lines, steps)
+        lines += ["# then: close the lane, apply the as-landed text, and commit the plan document and graph.yaml"]
+        return "\n".join(lines)
+    if action == "close":
         if n.get("status") not in FINISHED_STATUSES:
             raise SystemExit(f"refused: {nid} is {n.get('status')}, not done; use `abandon` to give up on a lane")
-        # A squash merge does not mark the branch merged, so -d would refuse it.
-        delete = "-D" if plan.get("commit_policy") == "squash" else "-d"
-        lines += [
-            f"git -C {q(str(root))} worktree remove {q(str(wt))}",
-            f"git -C {q(str(root))} branch {delete} {q(branch)}",
-            f"{me} set {graph} {q(nid)} lane= branch=",
-            "# then clean the lane's build directory if the worktree removal did not (project-specific)",
-        ]
-    elif action == "abandon":
+        steps = []
+        if wt.is_dir():
+            # `integrate` refused untracked files before the merge, so anything
+            # untracked now is output of the gates run at integration (a cache,
+            # a build directory the repository doesn't ignore). Tracked changes
+            # are not, and stop the close.
+            tracked = _git("-C", str(wt), "status", "--porcelain", "--untracked-files=no")
+            if tracked:
+                raise SystemExit(f"refused: tracked files changed in {wt} after integration:\n{tracked}")
+            force = "--force " if _git("-C", str(wt), "status", "--porcelain") else ""
+            steps.append(f"git -C {q(str(root))} worktree remove {force}{q(str(wt))}")
+        if _git("-C", str(root), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"):
+            # A squash merge does not mark the branch merged, so -d would refuse it.
+            steps.append(f"git -C {q(str(root))} branch {'-D' if policy == 'squash' else '-d'} {q(branch)}")
+        steps.append(f"{me} set {graph} {q(nid)} lane= branch=")
+        lines = _chain(lines, steps)
+        lines += ["# then clean the lane's build directory if it lives outside the worktree (project-specific)"]
+        return "\n".join(lines)
+    if action == "abandon":
+        if not wt.is_dir():
+            raise SystemExit(f"refused: the lane worktree {wt} does not exist")
         patch = scratch / f"{nid}.abandoned.patch"
-        lines += [
-            "# saves the lane's work as a patch, then deletes the worktree and the branch",
+        keep = f"abandoned/{nid}"
+        lines += ["# saves the lane's work as a patch, removes the worktree, and keeps every commit on the branch "
+                  f"{keep}"]
+        steps = [f"mkdir -p {q(str(scratch))}"]
+        if rebase_in_progress(wt):
+            steps.append(f"git -C {q(str(wt))} rebase --abort")
+        steps += [
             f"git -C {q(str(wt))} add -N .",
             f"git -C {q(str(wt))} diff $(git -C {q(str(wt))} merge-base HEAD {q(main)}) > {q(str(patch))}",
             f"git -C {q(str(root))} worktree remove --force {q(str(wt))}",
-            f"git -C {q(str(root))} branch -D {q(branch)}",
-            f"{me} set {graph} {q(nid)} status=blocked lane= branch= log=abandoned:{q(str(patch))}",
+            f"git -C {q(str(root))} branch -m {q(branch)} {q(keep)}",
+            f"{me} set {graph} {q(nid)} status=blocked lane= branch={q(keep)} log=abandoned:{q(str(patch))}",
         ]
-    else:
-        raise SystemExit("action must be open, integrate, close, or abandon")
-    return "\n".join(lines)
+        return "\n".join(_chain(lines, steps))
+    if action == "discard":
+        if not wt.is_dir():
+            raise SystemExit(f"refused: the lane worktree {wt} does not exist")
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        patch = scratch / f"{nid}.discarded-{stamp}.patch"
+        lines += ["# saves the lane's uncommitted changes as a patch, then restores the lane to its last commit"]
+        steps = [f"mkdir -p {q(str(scratch))}"]
+        if rebase_in_progress(wt):
+            steps.append(f"git -C {q(str(wt))} rebase --abort")
+        steps += [
+            f"git -C {q(str(wt))} add -N .",
+            f"git -C {q(str(wt))} diff HEAD > {q(str(patch))}",
+            f"git -C {q(str(wt))} reset --quiet --hard HEAD",
+            f"git -C {q(str(wt))} clean -fdq",
+        ]
+        return "\n".join(_chain(lines, steps))
+    raise SystemExit("action must be open, integrate, close, abandon, or discard")
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -511,7 +721,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("lane")
     p.add_argument("graph", type=Path)
     p.add_argument("id")
-    p.add_argument("action", choices=("open", "integrate", "close", "abandon"))
+    p.add_argument("action", choices=("open", "integrate", "close", "abandon", "discard"))
     p = sub.add_parser("excerpt")
     p.add_argument("graph", type=Path)
     p.add_argument("id")
@@ -521,8 +731,16 @@ def main(argv: list[str] | None = None) -> int:
     if not graph_path.is_file():
         print(f"no such file: {graph_path}", file=sys.stderr)
         return 2
-    data = load(graph_path)
 
+    if args.cmd == "set":
+        with locked(graph_path):
+            data = load(graph_path)
+            set_fields(data, args.id, args.assignments)
+            save(graph_path, data)
+        print(f"{args.id}: {' '.join(args.assignments)}")
+        return 0
+
+    data = load(graph_path)
     if args.cmd == "validate":
         errors, warns = validate(data, graph_path)
         for w in warns:
@@ -534,9 +752,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "waves":
         for i, layer in enumerate(waves(data), 1):
             print(f"wave {i}: {', '.join(layer)}")
-        nodes = by_id(data)
+        items = list(by_id(data).values())
         pairs = []
-        items = list(nodes.values())
         for a in range(len(items)):
             for b in range(a + 1, len(items)):
                 shared = set(items[a].get("files") or []) & set(items[b].get("files") or [])
@@ -544,6 +761,9 @@ def main(argv: list[str] | None = None) -> int:
                     pairs.append(f"{items[a]['id']} x {items[b]['id']} ({len(shared)} shared)")
         if pairs:
             print("exclusions (never at the same time): " + "; ".join(pairs))
+        alone = [n["id"] for n in items if runs_alone(n)]
+        if alone:
+            print("runs alone: " + ", ".join(alone))
         todo = [n for n in items if n.get("status") not in FINISHED_STATUSES]
         agents = sum(CHAIN_AGENTS.get(chain_of(n), 0) for n in todo)
         finals = sum(1 for n in todo if chain_of(n) in ("default", "docs-only"))
@@ -552,18 +772,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "next":
         start, hold, slots = next_ready(data)
-        print(f"free lane slots: {max(slots, 0)}")
+        open_lanes = [n["id"] for n in by_id(data).values() if n.get("status") in OPEN_STATUSES]
+        print(f"free lane slots: {max(slots, 0)}; open lanes: {', '.join(open_lanes) or 'none'}")
         for n in start:
             print(f"START {n['id']}: {n.get('title', '')} [{n.get('kind')}, {n.get('size')}, chain {chain_of(n)}]")
         for nid, why in hold:
             print(f"HOLD  {nid}: {why}")
-        if not start and not hold:
-            print("nothing left to schedule")
-        return 0
-    if args.cmd == "set":
-        set_fields(data, args.id, args.assignments)
-        save(graph_path, data)
-        print(f"{args.id}: {' '.join(args.assignments)}")
+        if not start and not open_lanes:
+            blocked = [i for i, n in by_id(data).items() if n.get("status") == "blocked"]
+            print("FINISHED: no lane is open and nothing can start"
+                  + (f"; blocked, for the user: {', '.join(blocked)}" if blocked else "")
+                  + ("; the HOLD lines above need the user" if hold else ""))
         return 0
     if args.cmd == "render":
         print(render(data))
@@ -577,7 +796,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"unknown node id: {args.id}", file=sys.stderr)
             return 2
         doc, anchor = spec_target(n, data, graph_path)
-        print(excerpt(doc, anchor))
+        try:
+            print(section(doc, anchor))
+        except AnchorError as exc:
+            print(f"{args.id}: {exc} in {doc}", file=sys.stderr)
+            return 1
         return 0
     return 2
 

@@ -1,12 +1,13 @@
 # graph.yaml — the machine-readable half of an executable plan.
 # The plan document (plan.spec) holds one anchored section per task; each node's
 # `spec` points at its anchor. See references/graph-schema.md for every field.
+# plan.py keeps these comments when it updates the file.
 plan:
   title: <plan title>
   spec: <plan document, .md or .html, relative to this file>
   integration_branch: main
-  worktree_root: ~/.local/state/git/worktrees/<repo>/lane   # lanes live at <root>/<id>
-  scratch_root: /path/with/room/lanes                        # scratch at <root>/<id>
+  worktree_root: ~/.local/state/git/worktrees/<repo>/lane   # lanes at <root>/<id>; relative = from this file
+  scratch_root: /path/with/room/lanes                        # reports and patches at <root>/<id>
   branch_prefix: lane/
   lane_cap: 3            # the machine sets this: one full build per lane
   autonomy: 2            # 0 full control … 2 default (P1s, decisions, destructive) … 4 autonomous
@@ -36,16 +37,16 @@ plan:
   notes: >-
     <machine limits, disk rules, anything that does not fit a field>
 nodes:
-  - id: <short-id>       # also the anchor, the branch suffix, and the worktree name
+  - id: <short-id>       # also the anchor, the branch suffix, and the worktree name; quote an all-digit id
     title: <one line>
     spec: "#<short-id>"  # or "<other document>#<anchor>"
     kind: code           # code | docs | plan | measurement
-    chain: default       # default | docs-only | none  (optional; kind implies it)
+    # chain: none        # optional override of the chain `kind` implies: default | docs-only | none
     size: M              # S | M | L
     deps: []             # hard: must be done first
     soft_deps: []        # preferred order
-    files:               # every file the task changes, tests and new files included
+    files:               # every existing file the task changes, tests included
       - <path>
-    alone: false         # true: runs with no other lane open
+    # alone: true        # runs with no other lane open (the default for kind: measurement)
     owner_decisions: []  # [{question: ..., default: ..., answer: ""}]
     status: planned      # planned | running | review | integrating | done | blocked | skipped

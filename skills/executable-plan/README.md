@@ -33,7 +33,8 @@ request outside a plan (use a review skill for that).
 ## Requirements
 
 - git 2.20 or later, for worktrees.
-- Python 3.11 with `uv`, for `scripts/plan.py` (`pyyaml` is declared inline).
+- Python 3.11 with `uv`, for `scripts/plan.py` (`ruamel.yaml` is declared
+  inline). POSIX only: `plan.py` locks the graph with `fcntl`.
 - An agent runtime that can run subagents in the background, ideally with a
   model id and an effort level per agent. The chain reference shows a script
   for a `Workflow` tool whose `agent()` takes `model` and `effort`, and a
@@ -45,12 +46,12 @@ request outside a plan (use a review skill for that).
 
 | Path | Purpose |
 | --- | --- |
-| `SKILL.md` | The skill: the two modes, the vocabulary, the autonomy levels, the rules every prompt carries. |
-| `scripts/plan.py` | `validate`, `waves`, `next`, `set`, `render`, `lane` (`open`, `integrate`, `close`, `abandon`), `excerpt` over `graph.yaml`. Runs only read-only git; prints every command that changes a repository. |
-| `scripts/test_plan.py` | Tests for `plan.py`, including a full lane in a temporary git repository: `uv run scripts/test_plan.py`. Agents never need it. |
+| `SKILL.md` | The skill: the two modes, the vocabulary, the iteration, the autonomy levels, the edge cases. |
+| `scripts/plan.py` | `validate`, `waves`, `next`, `set`, `render`, `lane` (`open`, `integrate`, `close`, `abandon`, `discard`), `excerpt` over `graph.yaml`. Runs only read-only git; prints every command that changes a repository as one `&&` chain. |
+| `scripts/test_plan.py` | Tests for `plan.py`: anchors, validation, scheduling, concurrent writes, and full lanes (land, crash and recover, abandon mid-rebase) in temporary git repositories. `uv run scripts/test_plan.py`. Agents never need it. |
 | `references/graph-schema.md` | Every field of `graph.yaml`, the anchor rules, the derived facts, and a full example. Read while drafting. |
-| `references/chain.md` | The four stage prompts as templates with placeholders, the decision step between the halves, and the workflow script shape. Read before the first lane. |
-| `references/coordinator.md` | The coordinator's procedure: pre-flight, the iteration, deciding findings, the integration protocol, the conflict rules, the failure cases, the final report. Read before the first iteration. |
+| `references/chain.md` | The four stage prompts as templates with placeholders, the decision step between the halves, reopening a lane, and how to run a half with or without a workflow tool. Read before the first lane. |
+| `references/coordinator.md` | The coordinator's procedure: pre-flight, the iteration, owner decisions, deciding findings, integration, the conflict rules, giving up, resuming, the failure cases, the final report. Read before the first iteration. |
 | `assets/graph-template.yaml` | A commented skeleton of `graph.yaml`. |
 | `assets/plan-template.md` | A plan document skeleton in Markdown, with the `<!-- task: id -->` marker convention. |
 | `assets/plan-template.html` | The same skeleton as a self-contained HTML page, with `id` anchors on the task headings. |
@@ -88,12 +89,38 @@ does run read-only git: `lane integrate` refuses a lane with uncommitted
 changes or no commits, because the failure it prevents is silent (the task
 is marked done and nothing lands).
 
-**Why stages commit.** Stages 1, 3, and 4 commit on the lane branch, and
-stage 2 leaves its proof tests uncommitted for stage 3 to convert or remove.
-The lane is clean when the chain ends, so the integration rebase works and
-the merge has something to land. Every stage diffs against the merge base,
-not the integration branch, so work that other lanes land doesn't show up
-reversed in a review.
+**Why every stage commits.** Each stage ends with a commit on the lane
+branch, so the lane is clean between stages. A stage that dies is rerun from
+its predecessor's commit after `lane ... discard` saves and drops its partial
+edits, the integration rebase always has a clean tree, and the merge always
+has something to land. Every stage diffs against the merge base, not the
+integration branch, so work that other lanes land doesn't show up reversed in
+a review.
+
+**Why reports are files.** Each stage writes its report to the lane's scratch
+directory and later stages read it there. Passing reports verbatim through
+the coordinator costs about six report copies per task; over a 30-task
+campaign that is about a million tokens of coordinator context.
+
+**Why stages bind every command to the lane.** In Claude Code a subagent's
+shell can return to the session's directory between calls, which is the main
+worktree on the integration branch. A stage that ran `cd` once and committed
+later would commit to `main`. The header makes every command `cd <lane> &&`
+or `git -C <lane>`, and `integrate` refuses a lane whose worktree is not on
+its branch.
+
+**Why the graph is locked.** Two `plan.py set` calls at once used to lose an
+update: a lane's `running` status vanished and its files stopped excluding
+other tasks. `set` now takes a lock in the git directory and writes through a
+temporary file. It uses `ruamel.yaml`, so comments the drafter wrote survive.
+
+**What the adversarial review of this skill found.** An Opus review at xhigh
+effort walked the protocol literally in scratch repositories. Besides the
+items above, it found: `alone` tasks started in the same batch as others;
+soft dependencies had no effect; anchors could resolve to the wrong section;
+the owner's answer never reached the stages; a crash between the merge and
+`status=done` could not be recovered; and `abandon` during a stopped rebase
+deleted commits. Each has a regression test in `scripts/test_plan.py`.
 
 **Why autonomy is a number.** The same plan runs unattended overnight at
 level 4 and under full control at level 0. Level 2 (stop for P1 findings,

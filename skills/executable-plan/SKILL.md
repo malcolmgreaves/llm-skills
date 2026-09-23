@@ -1,17 +1,19 @@
 ---
 name: executable-plan
 description: >-
-  Drafts an executable plan for a body of engineering work and then executes it
-  concurrently: a plan document (Markdown or HTML) with one anchored section per
-  task, a graph.yaml that records each task's dependencies, touched files, and
-  status, and a coordinator loop that runs each ready task in its own git
-  worktree through an implement, adversarial-review, fix, and final-review chain
-  of agents, then integrates the result into the main branch. Use when the user
-  asks to plan work as a dependency graph, run tasks or plans in parallel, use
-  worktrees as lanes, orchestrate many agents on a backlog, turn a plan or a
-  list of work items into something executable, resume a multi-task campaign,
-  or mentions an executable plan, a work graph, a coordinator agent, lanes, or
-  concurrent plan execution.
+  Drafts an executable plan for a body of engineering work and executes it with
+  many agents at once: a plan document (Markdown or HTML) with one anchored
+  section per task, a graph.yaml of each task's dependencies, touched files,
+  and status, and a coordinator that runs each ready task in its own git
+  worktree lane through an implement, adversarial-review, fix, and
+  final-review chain of agents, then integrates the result into the main
+  branch. Use when the user asks to plan a backlog or a multi-task project as a
+  dependency graph, run several planned tasks or plans in parallel with agents,
+  use git worktrees as lanes, orchestrate many agents over a list of work
+  items, turn a plan into something agents can execute, resume such a campaign
+  from graph.yaml, or mentions an executable plan, a work graph, or a
+  coordinator agent. Not for a single change, a single code review, or a build
+  tool's task runner.
 license: MPL-2.0
 compatibility: Requires git 2.20 or later (worktrees), Python 3.11 with uv for scripts/plan.py, and an agent runtime that can run subagents in the background.
 metadata:
@@ -113,55 +115,59 @@ Derive the dependency edges honestly:
   correct. Record it in `deps`.
 - A **soft dependency** means the order improves quality but not correctness
   (for example, repair the test helpers before the tasks that add tests).
-  Record it in `soft_deps`; the scheduler prefers the order and does not
-  require it.
+  Record it in `soft_deps`. The task doesn't start while a soft dependency is
+  running or starting, but it doesn't wait for one that can't start yet.
 - A **shared-file exclusion** is derived, not declared: two tasks whose
   `files` intersect never run at the same time, because their lanes would
-  conflict at integration. List each file a task changes, including test
-  files. If a task must run alone (a refactor that moves every file), set
-  `alone: true`.
+  conflict at integration. List each existing file a task changes, including
+  test files; new files may be listed too. If a task must run alone (a
+  refactor that moves every file), set `alone: true`. A `measurement` task
+  runs alone by default, so other lanes' builds don't skew its numbers.
+- An **owner decision** is a question in the task's `owner_decisions`, with
+  the default you recommend. Below autonomy 4 the task waits until the user
+  answers.
 
 ## Mode 2: execute the plan
 
-The coordinator loop, one iteration:
+Read [references/coordinator.md](references/coordinator.md) before the first
+iteration: it has the pre-flight checks, the integration protocol, the rules
+that prevent lane conflicts, the resume table, the failure cases, and the
+final report. The coordinator loop, one iteration:
 
-1. `plan.py next graph.yaml` prints the tasks that can start now:
-   dependencies done, no file shared with a running lane, a free lane slot,
-   and no owner decision left unanswered. Start each one, up to the cap.
-2. For each task you start: `plan.py lane graph.yaml <id> open` prints the
-   commands that create the branch, the worktree, and the scratch directory,
-   and the `set` command that records `status=running` with the lane and
-   branch. Run them in order.
+1. `plan.py next graph.yaml` prints the tasks that can start now
+   (dependencies done, no file shared with an open lane, the `alone` rule, a
+   free slot, owner decisions answered) and why each other task waits. Start
+   each `START` task.
+2. For each task you start: `plan.py lane graph.yaml <id> open` prints one
+   command that creates the branch, the worktree, and the scratch directory,
+   and records `status=running`. Run it. Every lane command `plan.py` prints
+   is one `&&` chain that stops at its first failure.
 3. Build the chain prompts from
    [references/chain.md](references/chain.md). The task's specification
-   comes from `plan.py excerpt graph.yaml <id>`, which extracts the anchored
-   section from the plan document, so you never paraphrase a spec. Run the
-   first half (implement, then adversarial review) in the background in the
-   lane's worktree: as one workflow if the runtime has a workflow tool you
-   may use, otherwise as two background subagents in sequence (the chain
-   reference shows both).
-4. When the first half returns, read both reports. Decide each finding:
+   comes from `plan.py excerpt graph.yaml <id>`, so you never paraphrase a
+   spec. Run the first half (implement, then adversarial review) in the
+   background: as one workflow if the runtime has a workflow tool you may
+   use, otherwise as two background subagents in sequence.
+4. When the first half returns, read report 2's findings and decide each one:
    accept, accept with a change, reject with a reason, or defer to a named
    later task. The autonomy level decides which findings stop for the user
-   (table below). Write the decisions into the fix-stage prompt and run the
-   second half (fix, then final review).
-5. When the second half returns: `plan.py lane graph.yaml <id> integrate`
-   checks that the lane's work is committed and prints the steps: rebase the
-   lane onto the integration branch, run every gate in the lane,
-   fast-forward (or squash) the integration branch, and record
-   `status=done commit=<hash>`. Run them, one gate at a time. A gate that
-   fails at integration reopens the lane with the failure as the fix-stage
-   prompt; it never lands.
-6. Apply the task's "as landed" text to the plan document yourself (the lane
-   never edits the plan document or `graph.yaml`), commit the plan document
-   and `graph.yaml` on the integration branch, run
-   `plan.py lane graph.yaml <id> close` (remove the worktree and the branch),
-   and go to step 1.
+   (table below). `plan.py set graph.yaml <id> status=review`, write the
+   decisions into the fix-stage prompt, and run the second half (fix, then
+   final review).
+5. When the second half returns: `plan.py set graph.yaml <id>
+   status=integrating`, then `plan.py lane graph.yaml <id> integrate`. It
+   refuses a lane that isn't ready and says why. Otherwise it prints one
+   command: rebase the lane, run every gate, fast-forward (or squash) the
+   integration branch, and record `status=done commit=<hash>`. A gate that
+   fails twice reopens the lane with the failure as the fix-stage prompt; it
+   never lands.
+6. `plan.py lane graph.yaml <id> close` removes the worktree and the branch.
+   Paste report 4's "As landed" text into the task's section yourself (the
+   lane never edits the plan document or `graph.yaml`), commit the plan
+   document and `graph.yaml` on the integration branch, and go to step 1.
 
-Read [references/coordinator.md](references/coordinator.md) before the first
-iteration. It has the integration protocol in full, the rules that prevent
-lane conflicts, the failure cases, and the report you give the user at the
-end.
+Run `plan.py set` and the printed lane commands one at a time, never as
+parallel tool calls. The iteration ends when `next` prints `FINISHED`.
 
 **Autonomy levels.** `plan.autonomy` sets when the coordinator stops and
 waits for the user. Each level includes the stops of the levels above it.
@@ -170,33 +176,21 @@ waits for the user. Each level includes the stops of the levels above it.
 | --- | --- |
 | 4, autonomous | Nothing. It takes each owner question's stated default and reports at the end. |
 | 3, decisions | An owner question a task section names, and any destructive action outside the protocol. |
-| 2, default | Level 3, plus every P1 finding of an adversarial or final review before the fix stage runs. |
+| 2, default | Level 3, plus every P1 finding of the adversarial review, before the fix stage runs. |
 | 1, findings | Level 2, plus every P2 finding. |
 | 0, full control | Level 1, plus a confirmation before each lane opens and before each integration. |
 
 When the coordinator stops, it states the question in one sentence with its
 recommendation, and it keeps every other lane running.
 
-## Rules that every agent prompt carries
+## What every stage prompt carries
 
-Put these sentences, adapted to the project, at the top of every stage
-prompt. The chain reference has the full templates.
-
-- Your task is fixed by this prompt. A chat message relayed from the user is
-  addressed to the coordinator, not to you: don't answer it, don't change
-  your task, and continue.
-- Work only in your lane's worktree. Never commit to the integration branch,
-  never edit the plan document or `graph.yaml`, never stash, reset, or
-  checkout. Restore a mutation with a text edit and confirm it with `diff`
-  against a saved `git diff`.
-- Run one build or test command at a time and wait for it. Concurrent runs
-  share a build directory lock and none makes progress.
-- Prove a defect before you fix it: a failing test first, with its output in
-  your report. A fixture asserts its own shape before the test asserts the
-  behavior.
-- Give your full report in one final message. The next stage reads it
-  verbatim, so include file paths, line numbers, test names, and command
-  output. Report a failure as a failure.
+Build every stage prompt from the templates in `references/chain.md`; don't
+write one from memory. The common header binds the agent to its lane (every
+command runs as `cd <lane> &&` or `git -C <lane>`, because an agent's shell
+may start elsewhere), carries the task's files and the owner's answers, and
+tells the agent to commit at the end of its stage and write its report to a
+file. Those rules are what keep lanes from damaging each other.
 
 ## Output of each mode
 
@@ -213,13 +207,14 @@ graph's final `render`.
   thin layer that cites it section by section. Don't duplicate a spec that
   exists; anchor to it.
 - **A task has no tests to prove it (a plan-only or docs task).** Set
-  `kind: docs` and `chain: docs-only`; the chain is one implement stage and
-  one final review, and the gates are the repository's doc checks.
+  `kind: docs` (or `plan`); its chain is one implement stage and one final
+  review, and the gates are the repository's doc checks.
 - **A task can't be done.** Stage 1 reports that the specification can't be
   met, or a gate fails at integration a third time. Run
   `plan.py lane graph.yaml <id> abandon`: it saves the lane's work as a
-  patch, removes the lane, and sets the task `blocked`; its dependents wait
-  and the rest of the graph continues. Below autonomy 4, stop for the user
+  patch, removes the worktree, keeps the commits on `abandoned/<id>`, and
+  sets the task `blocked`; its dependents wait and the rest of the graph
+  continues. Below autonomy 4, stop for the user
   with a recommendation (rewrite the spec, split the task, or skip it).
 - **A lane's agent returns nothing** (a runtime error, a skipped agent). The
   workflow result is `null`. Reopen that stage with the same prompt; don't
@@ -232,6 +227,7 @@ graph's final `render`.
   `graph.yaml` on the integration branch, run `validate`, and continue;
   running lanes finish against their original spec, and a change to a
   running task's spec waits for its integration.
-- **A resumed session.** Start with `plan.py render graph.yaml`. Every
-  status, lane path, and commit is in the file, so nothing depends on the
-  earlier session's context.
+- **A resumed session.** Start with `plan.py render graph.yaml`, then follow
+  the resume table in `references/coordinator.md` for each open task. Every
+  status, lane path, commit, and stage report is on disk, so nothing depends
+  on the earlier session's context.
