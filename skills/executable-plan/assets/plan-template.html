@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan title</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { max-width: 62rem; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+  nav { border: 1px solid #8884; border-radius: 6px; padding: .5rem 1rem; margin-bottom: 2rem; }
+  nav ul { margin: .25rem 0; padding-left: 1.25rem; }
+  h1, h2, h3 { line-height: 1.25; }
+  h3 { margin-top: 2.5rem; border-top: 1px solid #8884; padding-top: 1rem; }
+  code, pre { font-family: ui-monospace, monospace; font-size: .95em; }
+  pre { overflow-x: auto; padding: .75rem; border: 1px solid #8884; border-radius: 6px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #8884; padding: .3rem .5rem; vertical-align: top; text-align: left; }
+  blockquote { margin: 0; padding: .5rem 1rem; border-left: 4px solid #8886; }
+  .status { font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Plan title</h1>
+<blockquote>
+<p><strong>Executable plan.</strong> Status: <span class="status">Planned</span>.
+The graph is <code>graph.yaml</code> beside this file; run
+<code>plan.py render graph.yaml</code> for the live status. Each task heading
+below carries an <code>id</code> that <code>graph.yaml</code> points at.</p>
+</blockquote>
+
+<nav>
+<strong>Contents</strong>
+<ul>
+<li><a href="#scope">Scope</a></li>
+<li><a href="#non-goals">Non-goals</a></li>
+<li><a href="#settings">Project settings</a></li>
+<li><a href="#tasks">Tasks</a>
+  <ul>
+  <li><a href="#task-id"><code>task-id</code>: title</a></li>
+  </ul>
+</li>
+<li><a href="#residuals">Residuals</a></li>
+</ul>
+</nav>
+
+<h2 id="scope">Scope</h2>
+<p>What this plan covers, in three to six sentences, and the outcome when every
+task is done.</p>
+
+<h2 id="non-goals">Non-goals</h2>
+<ul>
+<li>What this plan does not change, and which plan owns it instead.</li>
+</ul>
+
+<h2 id="settings">Project settings</h2>
+<p>The commands, guidelines, models, and lane rules live in
+<code>graph.yaml: plan</code>. Summarize here what a reader needs without
+opening the graph: the gates in order, the guideline files, the lane cap, and
+the autonomy level.</p>
+
+<h2 id="tasks">Tasks</h2>
+<p>Each task follows the same shape. The <code>id</code> on the
+<code>h3</code> is the anchor; <code>plan.py excerpt</code> returns the section
+from that heading to the next <code>h3</code> or <code>h2</code>.</p>
+
+<h3 id="task-id"><code>task-id</code>: title</h3>
+<p><strong>Goal.</strong> One sentence.</p>
+<p><strong>Specification.</strong> What changes, where (files, functions,
+types), and the behavior after the change. Cite the prior plan section that
+decided the design, and quote the rule the change enforces.</p>
+<p><strong>Acceptance.</strong> The tests that prove it (red before, green
+after), the measurements, and the gates. Name the mutations that each new rule
+must fail.</p>
+<p><strong>Files.</strong> The list that <code>graph.yaml: files</code>
+mirrors.</p>
+<p><strong>Size.</strong> S, M, or L, with one line of reasoning.</p>
+<p><strong>Depends on.</strong> Hard dependencies, then soft dependencies,
+each with the reason.</p>
+<p><strong>Owner decisions.</strong> A question only the owner can answer, and
+the default you recommend. Omit the paragraph if there is none.</p>
+<p><strong>As landed.</strong> Empty until the task integrates. The
+coordinator pastes the final review's text here: what shipped, deviations,
+residuals, measurements.</p>
+
+<h2 id="residuals">Residuals</h2>
+<p>Defects found and deferred, each with the task that owns it or the note
+that no task does. The coordinator appends here at each integration.</p>
+</body>
+</html>

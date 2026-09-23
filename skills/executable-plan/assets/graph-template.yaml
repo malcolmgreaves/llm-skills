@@ -1,0 +1,51 @@
+# graph.yaml — the machine-readable half of an executable plan.
+# The plan document (plan.spec) holds one anchored section per task; each node's
+# `spec` points at its anchor. See references/graph-schema.md for every field.
+plan:
+  title: <plan title>
+  spec: <plan document, .md or .html, relative to this file>
+  integration_branch: main
+  worktree_root: ~/.local/state/git/worktrees/<repo>/lane   # lanes live at <root>/<id>
+  scratch_root: /path/with/room/lanes                        # scratch at <root>/<id>
+  branch_prefix: lane/
+  lane_cap: 3            # the machine sets this: one full build per lane
+  autonomy: 2            # 0 full control … 2 default (P1s, decisions, destructive) … 4 autonomous
+  commit_policy: keep    # keep | squash
+  models:
+    implement: <model id>
+    review: <model id>
+    fix: <model id>
+    final_review: <model id>
+  effort:
+    final_review: xhigh
+  commands:
+    build: <command>
+    test: <command>
+    lint: <command>
+    check: <command>
+    run: <command>
+  gates:                 # run in order, one at a time, in the lane and again at integration
+    - <format check>
+    - <type check>
+    - <lint>
+    - <tests>
+  guidelines:            # files every agent reads first
+    - <path>
+  prior_plans:           # plans the tasks cite
+    - <path>
+  notes: >-
+    <machine limits, disk rules, anything that does not fit a field>
+nodes:
+  - id: <short-id>       # also the anchor, the branch suffix, and the worktree name
+    title: <one line>
+    spec: "#<short-id>"  # or "<other document>#<anchor>"
+    kind: code           # code | docs | plan | measurement
+    chain: default       # default | docs-only | none  (optional; kind implies it)
+    size: M              # S | M | L
+    deps: []             # hard: must be done first
+    soft_deps: []        # preferred order
+    files:               # every file the task changes, tests and new files included
+      - <path>
+    alone: false         # true: runs with no other lane open
+    owner_decisions: []  # [{question: ..., default: ..., answer: ""}]
+    status: planned      # planned | running | review | integrating | done | blocked | skipped

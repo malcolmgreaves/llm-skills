@@ -12,6 +12,7 @@ claude.ai, the Claude API, and any other agent that implements the spec.
 | Skill | What it does |
 | --- | --- |
 | [google-developer-style](skills/google-developer-style/) | Rewrites all prose (replies, plans, commit messages, comments, docstrings, READMEs) to follow the Google developer documentation style guide: literal, second-person, active-voice, present-tense English with no figurative language or filler. |
+| [executable-plan](skills/executable-plan/) | Drafts an executable plan (a plan document with one anchored section per task plus a `graph.yaml` of dependencies, touched files, and status) and executes it concurrently: one git worktree per ready task, an implement → adversarial-review → fix → final-review chain of agents per task, and a coordinator that decides findings and integrates each lane into `main`. |
 
 ## Layout
 
