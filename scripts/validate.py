@@ -6,7 +6,7 @@
 """Validate skills in this repository against the Agent Skills specification.
 
 Usage:
-    uv run scripts/validate.py              # validate skills/ and template/
+    uv run scripts/validate.py              # validate skills/, template/, and marketplace.json
     uv run scripts/validate.py skills/foo   # validate specific directories
     uv run scripts/validate.py --strict     # treat warnings as failures
 
@@ -16,6 +16,7 @@ Spec: https://agentskills.io/specification
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from dataclasses import dataclass, field
@@ -243,6 +244,60 @@ def validate_skill(directory: Path) -> Report:
     return report
 
 
+def validate_marketplace(skill_dirs: list[Path]) -> Report:
+    """Every skill must be its own plugin in the Claude Code marketplace, and
+    every plugin must be exactly one skill. Nothing else catches a skill that
+    was added to skills/ but never listed, which leaves it uninstallable."""
+    path = REPO_ROOT / ".claude-plugin" / "marketplace.json"
+    report = Report(path=path)
+    if not path.is_file():
+        report.error("missing .claude-plugin/marketplace.json")
+        return report
+
+    try:
+        marketplace = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        report.error(f"not valid JSON: {exc}")
+        return report
+
+    plugins = marketplace.get("plugins") if isinstance(marketplace, dict) else None
+    if not isinstance(plugins, list):
+        report.error("`plugins` must be a list")
+        return report
+
+    listed: set[str] = set()
+    for index, plugin in enumerate(plugins):
+        if not isinstance(plugin, dict) or not isinstance(plugin.get("name"), str):
+            report.error(f"plugins[{index}] must be an object with a string `name`")
+            continue
+        name = plugin["name"]
+        if name in listed:
+            report.error(f"plugin `{name}` is listed more than once")
+        listed.add(name)
+        if not (REPO_ROOT / "skills" / name / "SKILL.md").is_file():
+            report.error(f"plugin `{name}` has no matching skills/{name}/SKILL.md")
+        # Each entry installs the whole repo and relies on `skills` to pick one
+        # skill out of it; without strict: false, Claude Code would look for a
+        # plugin.json instead and load every skill under skills/.
+        if plugin.get("source") != "./":
+            report.error(f"plugin `{name}` must have `\"source\": \"./\"`")
+        if plugin.get("strict") is not False:
+            report.error(f"plugin `{name}` must have `\"strict\": false`")
+        if plugin.get("skills") != [f"./skills/{name}"]:
+            report.error(f"plugin `{name}` must have `\"skills\": [\"./skills/{name}\"]`")
+        if not isinstance(plugin.get("description"), str) or not plugin["description"].strip():
+            report.error(f"plugin `{name}` needs a non-empty `description`")
+
+    for directory in skill_dirs:
+        if directory.name not in listed:
+            report.error(
+                f"skills/{directory.name} is not listed in marketplace.json, so "
+                "Claude Code users cannot install it"
+            )
+
+    return report
+
+
 def discover(targets: list[str]) -> list[Path]:
     if targets:
         return [Path(t).resolve() for t in targets]
@@ -277,6 +332,9 @@ def main() -> int:
         return 0
 
     reports = [validate_skill(d) for d in directories]
+    if not args.targets:
+        skills_dir = REPO_ROOT / "skills"
+        reports.append(validate_marketplace([d for d in directories if d.parent == skills_dir]))
     error_count = sum(len(r.errors) for r in reports)
     warning_count = sum(len(r.warnings) for r in reports)
 
@@ -292,7 +350,7 @@ def main() -> int:
             print(f"      warn:  {message}")
 
     print(
-        f"\n{len(reports)} skill(s) checked, "
+        f"\n{len(directories)} skill(s) checked, "
         f"{error_count} error(s), {warning_count} warning(s)"
     )
 

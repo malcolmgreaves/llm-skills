@@ -17,10 +17,46 @@ skills/<skill-name>/     one directory per skill
   assets/                optional: templates, fonts, images used in output
 template/                starter files for a new skill — not a loadable skill
 scripts/validate.py      spec linter for everything under skills/
+.claude-plugin/          Claude Code marketplace.json: one plugin per skill
 ```
 
 `skills/` is the only directory a skill loader sees. Do not put anything under it
 that is not a real, working skill.
+
+## Claude Code marketplace
+
+The repo is a Claude Code plugin marketplace (`malcolmgreaves`) in which every
+skill is a separately installable plugin with the same name as the skill. Each
+entry in `.claude-plugin/marketplace.json` has this shape:
+
+```json
+{
+  "name": "<skill-name>",
+  "source": "./",
+  "strict": false,
+  "skills": ["./skills/<skill-name>"],
+  "description": "One sentence: what the skill does."
+}
+```
+
+The fields depend on each other:
+
+- `source: "./"` is required because a plugin can only reference files inside
+  its source, and the skill lives under the repo root.
+- `strict: false` makes the entry the whole plugin definition. Without it,
+  Claude Code looks for a `plugin.json` and auto-discovers every skill in
+  `skills/`, so each plugin would install all of them.
+- `skills` then selects the one skill that the plugin ships.
+- `description` is what users see in `/plugin`. Keep it short. The skill's own
+  frontmatter `description` stays the trigger.
+
+Do not add a root `.claude-plugin/plugin.json`, and do not add `version` to an
+entry. Without a version, Claude Code versions each plugin by git commit SHA,
+so every push reaches users. With one, users stay on their cached copy until the
+string changes.
+
+`scripts/validate.py` fails if a skill has no entry, an entry has no skill, or
+an entry deviates from the shape above.
 
 ## The one rule that matters
 
@@ -104,7 +140,9 @@ Structure for progressive disclosure — the agent pays for what it loads:
    whatever you only understood because you'd just written it.
 5. Fill in `README.md`, listing every bundled file and what it is for.
 6. Add the skill to the table in the root `README.md`.
-7. Validate: `uv run scripts/validate.py`.
+7. Add a plugin entry for it to `.claude-plugin/marketplace.json` (see
+   [Claude Code marketplace](#claude-code-marketplace)).
+8. Validate: `uv run scripts/validate.py` and `claude plugin validate .`.
 
 ## Validating
 
@@ -112,7 +150,7 @@ Structure for progressive disclosure — the agent pays for what it loads:
 its dependencies are declared inline, so there is no venv to create or activate:
 
 ```bash
-uv run scripts/validate.py              # skills/* and template/
+uv run scripts/validate.py              # skills/*, template/, and marketplace.json
 uv run scripts/validate.py skills/foo   # one directory
 uv run scripts/validate.py --strict     # warnings fail too
 ```

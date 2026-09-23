@@ -1,0 +1,37 @@
+{
+  "name": "malcolmgreaves",
+  "owner": {
+    "name": "Malcolm Greaves"
+  },
+  "description": "The personal Agent Skills collection of Malcolm Greaves.",
+  "plugins": [
+    {
+      "name": "executable-plan",
+      "source": "./",
+      "strict": false,
+      "skills": ["./skills/executable-plan"],
+      "description": "Plans work as a task graph and executes it in parallel git-worktree lanes, each run by an implement, review, and fix chain of agents.",
+      "author": {
+        "name": "Malcolm Greaves"
+      },
+      "homepage": "https://github.com/malcolmgreaves/llm-skills/tree/main/skills/executable-plan",
+      "repository": "https://github.com/malcolmgreaves/llm-skills",
+      "license": "MPL-2.0",
+      "keywords": ["planning", "parallel", "worktrees", "agents"]
+    },
+    {
+      "name": "google-developer-style",
+      "source": "./",
+      "strict": false,
+      "skills": ["./skills/google-developer-style"],
+      "description": "Writes all prose (replies, commit messages, comments, docstrings, and docs) in the Google developer documentation style.",
+      "author": {
+        "name": "Malcolm Greaves"
+      },
+      "homepage": "https://github.com/malcolmgreaves/llm-skills/tree/main/skills/google-developer-style",
+      "repository": "https://github.com/malcolmgreaves/llm-skills",
+      "license": "MPL-2.0",
+      "keywords": ["writing", "style-guide", "documentation"]
+    }
+  ]
+}

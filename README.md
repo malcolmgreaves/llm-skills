@@ -23,6 +23,7 @@ skills/<skill-name>/
 ├── scripts/       # optional — executable code, run via bash
 ├── references/    # optional — docs the agent reads on demand
 └── assets/        # optional — templates, fonts, images used in output
+.claude-plugin/    # Claude Code marketplace: one plugin per skill
 template/          # starter SKILL.md + README.md for a new skill
 scripts/validate.py # spec linter: uv run scripts/validate.py
 AGENTS.md          # authoring guide (CLAUDE.md symlinks here)
@@ -44,9 +45,33 @@ nothing:
 
 ## Installing
 
-### Claude Code
+### Claude Code (plugin)
 
-Symlink individual skills, personal or per-project:
+This repo is a Claude Code plugin marketplace in which every skill is its own
+plugin, named after the skill. Add the marketplace once, then install only the
+skills you want:
+
+```text
+/plugin marketplace add malcolmgreaves/llm-skills
+/plugin install <skill-name>@malcolmgreaves
+```
+
+Run `/plugin` and open the **Discover** tab to browse the available skills.
+Skills installed this way are namespaced by their plugin: invoke one as
+`/<skill-name>:<skill-name>`, or describe the task and let the agent trigger
+it. Pull new commits with `/plugin marketplace update malcolmgreaves`, or turn
+on auto-update for the marketplace under `/plugin` → **Marketplaces**.
+
+To try every skill in a local checkout without installing anything:
+
+```bash
+claude --plugin-dir /path/to/llm-skills
+```
+
+### Claude Code (symlink)
+
+To track a local checkout without the plugin system, symlink skills, personal
+or per-project:
 
 ```bash
 # personal — available in every project on this machine
@@ -94,7 +119,8 @@ cp -r template skills/<skill-name>
 
 Set `name:` to match the directory, write the `description` first (it's the
 trigger, and the hardest part to get right), keep `SKILL.md` under 500 lines,
-and add a row to the table above.
+add a row to the table above, and add a plugin entry for it to
+`.claude-plugin/marketplace.json`.
 
 Then lint it — no venv setup required, [uv](https://docs.astral.sh/uv/) resolves
 the script's inline dependencies on the fly:
@@ -105,7 +131,8 @@ uv run scripts/validate.py
 
 This checks the spec rules (name/directory agreement, field lengths, reserved
 words), rejects client-specific frontmatter that would break a claude.ai upload,
-and verifies every relative path `SKILL.md` points at actually resolves.
+verifies every relative path `SKILL.md` points at actually resolves, and checks
+that every skill has exactly one entry in the plugin marketplace.
 
 ## Prior art
 
