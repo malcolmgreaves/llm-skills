@@ -74,7 +74,7 @@ repository does not already answer; read its guideline files first.
 | Scope and non-goals | plan document `## Scope` | The reviewers refuse scope creep with a reference. |
 | Function, behavior, and performance requirements | each task's `Acceptance` | They become tests and measurements, not opinions. |
 | Where worktrees and scratch directories go, the lane cap, the branch prefix | `worktree_root`, `scratch_root`, `lane_cap`, `branch_prefix` | The machine sets the cap: each lane builds with every core and its own build directory. |
-| Models and effort per stage | `models`, `effort` | The final reviewer is usually the strongest model at high effort, used once per task. |
+| Models and effort per stage | `models`, `effort` | Default to a cheaper model (Sonnet-class) for implement and fix, and the strongest model for review and final review. The reviewers are where model strength pays off. |
 | Autonomy level (0 to 4, default 2) | `autonomy` | See the table under Mode 2. |
 | Keep or squash lane commits at integration | `commit_policy` | Keeping them preserves each chain's measurements in the history. |
 
@@ -83,7 +83,16 @@ write: the goal in one sentence; the specification (what changes, where, and
 the behavior after the change); the acceptance criteria (which tests prove it,
 which measurements, which gates); the files it changes; its size (S, M, L);
 its hard dependencies and soft dependencies; and any decision that only the
-owner can make, stated as a question with the default you recommend.
+owner can make, stated as a question with the default you recommend. Look
+hard for those questions: every place the backlog's wording allows two
+readings is one.
+
+Size picks the chain, and the chain is most of the cost. An S `code` task
+gets the `light` chain (implement, then one final review); M and L get the
+full four-stage chain. Set `chain: default` on an S task when a wrong result
+would be costly (untrusted input, persistence, security, concurrency, a
+public interface). A backlog of S tasks on a light chain costs about a
+quarter of the full chain's time.
 
 Then write the two files, side by side in the directory where the
 repository keeps plans (for example `plans/<plan-name>/`; ask if the
@@ -101,13 +110,22 @@ repository has no convention):
 
 Validate before you show the result: `plan.py validate graph.yaml`. It
 checks the schema, rejects a cycle, confirms that every `spec` anchor exists
-in its document, and warns about a code task with no `files`. Then show the
-user `plan.py waves graph.yaml`, which prints the concurrent waves the
-dependencies allow, the file exclusions, and the number of agent runs the
-plan costs, and iterate on the plan with them until they approve it. The plan
-is a discussion artifact first and an execution artifact second. Once they
-approve it, commit both files on the integration branch; execution starts
-from that commit.
+in its document, and warns about a code task with no `files`. Then run
+`plan.py waves graph.yaml`. It prints the concurrent waves the dependencies
+allow, the file exclusions, the hub files several tasks share, the agent
+runs, and an estimate of the time on the critical path, and it warns when the
+plan is serial. Fix a serial plan with a seam (below) before you show it.
+
+Show the user the plan, the `waves` output, and every owner question in one
+message, with your recommended default for each. Ask them all now, even when
+the user says they will be away: "don't block me mid-run" is not "don't ask
+at all", and an answer before the first lane opens costs nothing. Record the
+answers with `plan.py set`. Only when nobody can answer (a headless run),
+take for each question the most literal reading of the specification's
+words, and list it in the final report. Iterate until the user approves the
+plan; it is a discussion artifact first and an execution artifact second.
+Once they approve it, commit both files on the integration branch; execution
+starts from that commit.
 
 Derive the dependency edges honestly:
 
@@ -127,6 +145,16 @@ Derive the dependency edges honestly:
   the default you recommend. Below autonomy 4 the task waits until the user
   answers.
 
+**Seams.** A straight chain of dependencies runs one lane at a time, and a
+file every task touches (a CLI entry point, a router, a schema) turns
+parallel tasks into a chain or into merge conflicts. Before you accept either,
+look for a seam: a small task, usually `chain: none` so you do it yourself on
+the integration branch, that lands the shared interface first (an argument
+parser with every flag stubbed, a result object with a slot per feature,
+function signatures that raise "not implemented"). The tasks that fill the
+seam then depend on it, not on each other, and run in parallel. `waves`
+names the hub files and warns when every wave holds one task.
+
 ## Mode 2: execute the plan
 
 Read [references/coordinator.md](references/coordinator.md) before the first
@@ -142,18 +170,23 @@ final report. The coordinator loop, one iteration:
    command that creates the branch, the worktree, and the scratch directory,
    and records `status=running`. Run it. Every lane command `plan.py` prints
    is one `&&` chain that stops at its first failure.
-3. Build the chain prompts from
-   [references/chain.md](references/chain.md). The task's specification
-   comes from `plan.py excerpt graph.yaml <id>`, so you never paraphrase a
-   spec. Run the first half (implement, then adversarial review) in the
-   background: as one workflow if the runtime has a workflow tool you may
-   use, otherwise as two background subagents in sequence.
-4. When the first half returns, read report 2's findings and decide each one:
-   accept, accept with a change, reject with a reason, or defer to a named
-   later task. The autonomy level decides which findings stop for the user
-   (table below). `plan.py set graph.yaml <id> status=review`, write the
-   decisions into the fix-stage prompt, and run the second half (fix, then
-   final review).
+3. For each stage, `plan.py prompt graph.yaml <id> <stage>` renders the
+   stage's prompt from the templates in
+   [references/chain.md](references/chain.md) into the lane's scratch
+   directory and prints a one-line launcher; give the agent that line and
+   the stage's model. Never write a stage prompt by hand. Run the stages of
+   the task's chain in the background, in order: as one workflow if the
+   runtime has a workflow tool you may use, otherwise as background
+   subagents in sequence. A `light` chain is implement, then final review;
+   skip to step 5 when it returns.
+4. In a `default` chain, when the review returns, read report 2's findings
+   and decide each one by its scope label: accept `spec`, accept a small
+   `defect`, record `beyond` as a residual. A fix that would remove or change
+   behavior the spec doesn't mention is an owner decision. The autonomy level
+   decides which findings stop for the user (table below). Write the
+   decisions to `<scratch>/<id>_decisions.md`, `plan.py set graph.yaml <id>
+   status=review`, and run the fix (`plan.py prompt ... fix --decisions
+   <file>`) and the final review.
 5. When the second half returns: `plan.py set graph.yaml <id>
    status=integrating`, then `plan.py lane graph.yaml <id> integrate`. It
    refuses a lane that isn't ready and says why. Otherwise it prints one
@@ -162,9 +195,10 @@ final report. The coordinator loop, one iteration:
    fails twice reopens the lane with the failure as the fix-stage prompt; it
    never lands.
 6. `plan.py lane graph.yaml <id> close` removes the worktree and the branch.
-   Paste report 4's "As landed" text into the task's section yourself (the
-   lane never edits the plan document or `graph.yaml`), commit the plan
-   document and `graph.yaml` on the integration branch, and go to step 1.
+   `plan.py landed graph.yaml <id> <scratch>/<id>_report_4.md` pastes the
+   final review's "As landed" text into the task's section (the lane never
+   edits the plan document or `graph.yaml`). Commit the plan document and
+   `graph.yaml` on the integration branch, and go to step 1.
 
 Run `plan.py set` and the printed lane commands one at a time, never as
 parallel tool calls. The iteration ends when `next` prints `FINISHED`.
@@ -175,7 +209,7 @@ waits for the user. Each level includes the stops of the levels above it.
 | Level | The coordinator stops for |
 | --- | --- |
 | 4, autonomous | Nothing. It takes each owner question's stated default and reports at the end. |
-| 3, decisions | An owner question a task section names, and any destructive action outside the protocol. |
+| 3, decisions | An owner question a task section names, a fix that would remove or change behavior the spec doesn't mention, and any destructive action outside the protocol. |
 | 2, default | Level 3, plus every P1 finding of the adversarial review, before the fix stage runs. |
 | 1, findings | Level 2, plus every P2 finding. |
 | 0, full control | Level 1, plus a confirmation before each lane opens and before each integration. |
@@ -185,12 +219,16 @@ recommendation, and it keeps every other lane running.
 
 ## What every stage prompt carries
 
-Build every stage prompt from the templates in `references/chain.md`; don't
-write one from memory. The common header binds the agent to its lane (every
+`plan.py prompt` renders every stage prompt from the templates in
+`references/chain.md`. The common header binds the agent to its lane (every
 command runs as `cd <lane> &&` or `git -C <lane>`, because an agent's shell
-may start elsewhere), carries the task's files and the owner's answers, and
-tells the agent to commit at the end of its stage and write its report to a
-file. Those rules are what keep lanes from damaging each other.
+may start elsewhere), carries the task's files and the owner's answers,
+limits the change to what the spec asks for, and tells the agent to commit at
+the end of its stage and write its report to a file. Those rules are what
+keep lanes from damaging each other and the tasks from growing.
+
+If `uv` can't write its cache (a sandbox), set `UV_CACHE_DIR` to a writable
+directory, for example `UV_CACHE_DIR=$TMPDIR/uv-cache`.
 
 ## Output of each mode
 

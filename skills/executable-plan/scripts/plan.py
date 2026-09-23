@@ -14,6 +14,10 @@ Usage:
     uv run plan.py lane GRAPH ID ACTION        # print the shell command for a lane action:
                                                #   open, integrate, close, abandon, discard
     uv run plan.py excerpt GRAPH ID            # the task's section from the plan document
+    uv run plan.py prompt GRAPH ID STAGE [--decisions FILE]
+                                               # render a stage prompt to the lane's scratch
+                                               #   directory; print the launcher line
+    uv run plan.py landed GRAPH ID REPORT      # paste a report's "As landed" text into the plan
 
 The script runs only read-only git commands. It prints every command that
 changes a repository for the coordinator to run, as one `&&` chain that
@@ -31,6 +35,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
 from io import StringIO
@@ -42,7 +47,7 @@ STATUSES = ("planned", "running", "review", "integrating", "done", "blocked", "s
 OPEN_STATUSES = ("running", "review", "integrating")
 FINISHED_STATUSES = ("done", "skipped")
 KINDS = ("code", "docs", "plan", "measurement")
-CHAINS = ("default", "docs-only", "none")
+CHAINS = ("default", "light", "docs-only", "none")
 SIZES = ("S", "M", "L")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 PLAN_REQUIRED = (
@@ -50,9 +55,21 @@ PLAN_REQUIRED = (
     "branch_prefix", "lane_cap", "autonomy", "commit_policy", "models", "gates",
 )
 MODEL_STAGES = ("implement", "review", "fix", "final_review")
-# Agents per chain; `measurement` is the implied chain of a measurement task.
-CHAIN_AGENTS = {"default": 4, "docs-only": 2, "measurement": 1, "none": 0}
+# The stages of each chain; `measurement` is the implied chain of a measurement task.
+CHAIN_STAGES = {
+    "default": ("implement", "review", "fix", "final-review"),
+    "light": ("implement", "final-review"),
+    "docs-only": ("implement", "final-review"),
+    "measurement": ("implement",),
+    "none": (),
+}
+STAGE_NUMBER = {"implement": 1, "review": 2, "fix": 3, "final-review": 4}
+# Minutes of agent time per stage for an S task, from measured runs; M doubles, L quadruples.
+# plan.stage_minutes overrides them (keys: implement, review, fix, final_review).
+STAGE_MINUTES = {"implement": 3.0, "review": 4.5, "fix": 3.5, "final-review": 1.5}
+SIZE_FACTOR = {"S": 1, "M": 2, "L": 4}
 SELF = Path(__file__).resolve()
+CHAIN_DOC = SELF.parent.parent / "references" / "chain.md"
 
 _yaml = YAML()  # round-trip mode: keeps the comments, quotes, and layout the drafter wrote
 _yaml.preserve_quotes = True  # an unquoted `yes` is a boolean to YAML 1.1 readers
@@ -111,9 +128,23 @@ def by_id(data: dict) -> dict[str, dict]:
 
 
 def chain_of(node: dict) -> str:
+    """The node's chain: its `chain` field, or the default for its kind and size."""
     if node.get("chain"):
         return str(node["chain"])
-    return {"docs": "docs-only", "plan": "docs-only", "measurement": "measurement"}.get(node.get("kind"), "default")
+    kind = node.get("kind")
+    if kind in ("docs", "plan"):
+        return "docs-only"
+    if kind == "measurement":
+        return "measurement"
+    return "light" if node.get("size") == "S" else "default"
+
+
+def task_minutes(node: dict, plan: dict) -> float:
+    """Estimated agent minutes for the node's whole chain."""
+    override = {k.replace("_", "-"): float(v) for k, v in (plan.get("stage_minutes") or {}).items()}
+    per_stage = {**STAGE_MINUTES, **override}
+    factor = SIZE_FACTOR.get(node.get("size"), 1)
+    return sum(per_stage[s] for s in CHAIN_STAGES.get(chain_of(node), ())) * factor
 
 
 def runs_alone(node: dict) -> bool:
@@ -127,6 +158,17 @@ def spec_target(node: dict, data: dict, graph_path: Path) -> tuple[Path, str]:
     doc, _, anchor = spec.partition("#")
     path = graph_path.parent / (doc or str(data["plan"].get("spec", "")))
     return path, anchor
+
+
+def resolve_doc(rel: str, graph_path: Path) -> Path:
+    """A path from graph.yaml: absolute, or relative to graph.yaml's directory, or to the repository root."""
+    path = Path(os.path.expanduser(rel))
+    if path.is_absolute():
+        return path
+    for base in (graph_path.parent, repo_root(graph_path)):
+        if (base / path).exists():
+            return (base / path).resolve()
+    return (graph_path.parent / path).resolve()
 
 
 def root_dir(plan: dict, key: str, graph_path: Path) -> Path:
@@ -195,7 +237,8 @@ def _md_scan(lines: list[str]) -> tuple[dict[int, int], list[tuple[int, str]], l
     return headings, markers, live
 
 
-def _md_section(text: str, anchor: str) -> str:
+def _md_bounds(text: str, anchor: str) -> tuple[int, int, list[str]]:
+    """The line range [start, end) of the Markdown section that `anchor` names."""
     lines = text.splitlines()
     headings, markers, live = _md_scan(lines)
     hits = [i for i, a in markers if a == anchor]
@@ -231,6 +274,11 @@ def _md_section(text: str, anchor: str) -> str:
             raise AnchorError(f"no section for task {anchor!r}")
     level = headings[start]
     end = next((j for j in sorted(headings) if j > start and headings[j] <= level), len(lines))
+    return start, end, lines
+
+
+def _md_section(text: str, anchor: str) -> str:
+    start, end, lines = _md_bounds(text, anchor)
     return "\n".join(lines[start:end]).strip()
 
 
@@ -246,8 +294,10 @@ def _strip_html(fragment: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def _html_section(text: str, anchor: str) -> str:
-    clean = re.sub(r"(?s)<!--.*?-->", "", text)
+def _html_bounds(text: str, anchor: str) -> tuple[int, int]:
+    """The character range of the HTML section whose heading carries id=anchor."""
+    # Blank out comments with spaces, so offsets into `clean` are offsets into `text`.
+    clean = re.sub(r"(?s)<!--.*?-->", lambda m: " " * len(m.group()), text)
     id_attr = rf"""\sid\s*=\s*["']{re.escape(anchor)}["']"""  # ids are case-sensitive
     everywhere = re.findall(rf"<[A-Za-z][^>]*?{id_attr}", clean)
     if len(everywhere) > 1:
@@ -258,7 +308,13 @@ def _html_section(text: str, anchor: str) -> str:
         raise AnchorError(f'no heading with id="{anchor}"{where}')
     level = int(m.group(1))
     end = re.compile(rf"<h[1-{level}]\b", re.I).search(clean, m.end())
-    return _strip_html(clean[m.start(): end.start() if end else len(clean)])
+    return m.start(), end.start() if end else len(clean)
+
+
+def _html_section(text: str, anchor: str) -> str:
+    start, end = _html_bounds(text, anchor)
+    clean = re.sub(r"(?s)<!--.*?-->", lambda m: " " * len(m.group()), text)
+    return _strip_html(clean[start:end])
 
 
 def section(doc: Path, anchor: str) -> str:
@@ -304,7 +360,7 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
     if not spec_doc.is_file():
         errors.append(f"plan.spec does not exist: {spec_doc}")
     for rel in plan.get("guidelines") or []:
-        if not (graph_path.parent / str(rel)).exists() and not Path(str(rel)).expanduser().exists():
+        if not resolve_doc(str(rel), graph_path).exists():
             warnings.append(f"guideline file not found: {rel}")
     if "worktree_root" in plan:
         wt_root = root_dir(plan, "worktree_root", graph_path)
@@ -415,6 +471,26 @@ def waves(data: dict) -> list[list[str]]:
         out.append(layer)
         placed.update(layer)
     return out
+
+
+def critical_path(data: dict) -> tuple[list[str], float, float]:
+    """(the longest chain of unfinished tasks by hard deps, its minutes, the minutes of all tasks)."""
+    plan = data["plan"]
+    nodes = {i: n for i, n in by_id(data).items() if n.get("status") not in FINISHED_STATUSES}
+    best: dict[str, tuple[float, list[str]]] = {}
+
+    def longest(i: str) -> tuple[float, list[str]]:
+        if i not in best:
+            before = [longest(d) for d in nodes[i].get("deps") or [] if d in nodes]
+            t, path = max(before, default=(0.0, []), key=lambda x: x[0])
+            best[i] = (t + task_minutes(nodes[i], plan), path + [i])
+        return best[i]
+
+    if find_cycle(data):
+        return [], 0.0, 0.0
+    runs = [longest(i) for i in nodes]
+    t, path = max(runs, default=(0.0, []), key=lambda x: x[0])
+    return path, t, sum(task_minutes(n, plan) for n in nodes.values())
 
 
 def next_ready(data: dict) -> tuple[list[dict], list[tuple[str, str]], int]:
@@ -706,6 +782,141 @@ def lane_commands(data: dict, graph_path: Path, nid: str, action: str) -> str:
     raise SystemExit("action must be open, integrate, close, abandon, or discard")
 
 
+# ── stage prompts ──────────────────────────────────────────────────────────────
+
+TEMPLATE_RE = re.compile(r"^```template:([\w-]+)\n(.*?)^```", re.M | re.S)
+
+
+def templates() -> dict[str, str]:
+    found = dict(TEMPLATE_RE.findall(CHAIN_DOC.read_text(encoding="utf-8")))
+    missing = {"header", "implement", "implement-measurement", "review", "fix", "final-review",
+               "final-review-light"} - set(found)
+    if missing:
+        raise SystemExit(f"{CHAIN_DOC} lacks the templates: {', '.join(sorted(missing))}")
+    return found
+
+
+def _owner_decisions(node: dict, autonomy: int) -> str:
+    items = []
+    for od in node.get("owner_decisions") or []:
+        answer = str(od.get("answer") or "").strip()
+        if answer:
+            items.append(f"{od['question']} -> {answer}")
+        elif autonomy >= 4:
+            items.append(f"{od['question']} -> {od['default']} (taken by default)")
+        else:
+            raise SystemExit(f"refused: the owner hasn't answered: {od['question']}")
+    return "; ".join(items) or "none"
+
+
+def render_prompt(data: dict, graph_path: Path, nid: str, stage: str, decisions: Path | None) -> tuple[Path, str]:
+    """Fill the stage's template; return (prompt file, launcher line)."""
+    plan = data["plan"]
+    n = by_id(data).get(nid)
+    if n is None:
+        raise SystemExit(f"unknown node id: {nid}")
+    chain = chain_of(n)
+    if stage == "fix" and decisions is None:
+        raise SystemExit("refused: the fix stage needs --decisions FILE (one decision per finding, or the gate failure)")
+    # A reopened lane runs the fix stage whatever its chain.
+    if stage not in CHAIN_STAGES.get(chain, ()) and stage != "fix":
+        raise SystemExit(f"refused: {nid} runs the `{chain}` chain, which has no {stage} stage")
+    name = {
+        "implement": "implement-measurement" if chain == "measurement" else "implement",
+        "review": "review",
+        "fix": "fix",
+        "final-review": "final-review" if chain == "default" else "final-review-light",
+    }[stage]
+    doc, anchor = spec_target(n, data, graph_path)
+    try:
+        spec = section(doc, anchor)
+    except AnchorError as exc:
+        raise SystemExit(f"{nid}: {exc} in {doc}")
+    scratch = root_dir(plan, "scratch_root", graph_path) / nid
+    commands = plan.get("commands") or {}
+    values = {
+        "task_id": nid,
+        "task_title": str(n.get("title", "")),
+        "lane_worktree": str(n.get("lane") or root_dir(plan, "worktree_root", graph_path) / nid),
+        "lane_branch": str(n.get("branch") or f"{plan['branch_prefix']}{nid}"),
+        "integration_branch": str(plan["integration_branch"]),
+        "scratch": str(scratch),
+        "stage": str(STAGE_NUMBER[stage]),
+        "guidelines": ", ".join(str(resolve_doc(str(g), graph_path)) for g in plan.get("guidelines") or []) or "none",
+        "prior_plans": ", ".join(str(resolve_doc(str(g), graph_path)) for g in plan.get("prior_plans") or []) or "none",
+        "commands": "; ".join(f"{k}: `{v}`" for k, v in commands.items()) or "see the gates",
+        "gates": ", then ".join(f"`{g}`" for g in plan.get("gates") or []),
+        "files": ", ".join(str(f) for f in n.get("files") or []) or "none listed",
+        "owner_decisions": _owner_decisions(n, int(plan.get("autonomy", 2))),
+        "spec": spec,
+        "decisions": decisions.read_text(encoding="utf-8").strip() if decisions else "",
+    }
+    tpl = templates()
+    text = tpl[name].replace("{{common header}}", tpl["header"].rstrip("\n"))
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", value)
+    left = sorted(set(re.findall(r"\{\{[\w ]+\}\}", text)))
+    if left:
+        raise SystemExit(f"template {name} has unknown placeholders: {', '.join(left)}")
+    scratch.mkdir(parents=True, exist_ok=True)
+    out = scratch / f"{nid}_prompt_{STAGE_NUMBER[stage]}.md"
+    out.write_text(text, encoding="utf-8")
+    launcher = (f"You are stage {STAGE_NUMBER[stage]} ({stage}) of task {nid}. Your complete instructions are "
+                f"in {out}. Read that file first and follow it exactly; it is your whole task.")
+    return out, launcher
+
+
+# ── as-landed text ─────────────────────────────────────────────────────────────
+
+AS_LANDED_RE = re.compile(r"^\s*(?:(#{1,6})\s*|\*\*)?(?:\(?\d\)?\.?\s*)?As landed\b[.:*\s]*$", re.I)
+
+
+def as_landed_text(report: Path) -> str:
+    """The text under a report's "As landed" heading, up to the next heading of the same or a higher level."""
+    lines = report.read_text(encoding="utf-8").splitlines()
+    for i, line in enumerate(lines):
+        m = AS_LANDED_RE.match(line)
+        if not m:
+            continue
+        level = len(m.group(1)) if m.group(1) else 7
+        body = []
+        for nxt in lines[i + 1:]:
+            h = HEADING_RE.match(nxt)
+            if h and len(h.group(1)) <= level:
+                break
+            body.append(nxt)
+        text = "\n".join(body).strip()
+        if text:
+            return text
+    raise SystemExit(f"no \"As landed\" heading with text in {report}")
+
+
+def apply_landed(doc: Path, anchor: str, text: str) -> None:
+    """Replace the "As landed" paragraph of a task's section (or append one) with `text`."""
+    source = doc.read_text(encoding="utf-8")
+    if doc.suffix.lower() in (".html", ".htm"):
+        start, end = _html_bounds(source, anchor)
+        paras = "\n".join(f"<p>{html_lib.escape(p.strip())}</p>" for p in re.split(r"\n\s*\n", text) if p.strip())
+        block = f"<p><strong>As landed.</strong></p>\n{paras}\n"
+        part = source[start:end]
+        m = re.search(r"(?is)<p>\s*<strong>\s*As landed\.?\s*</strong>.*?</p>\s*", part)
+        part = part[:m.start()] + block + part[m.end():] if m else part.rstrip() + "\n" + block + "\n"
+        result = source[:start] + part + source[end:]
+    else:
+        start, end, lines = _md_bounds(source, anchor)
+        body = lines[start:end]
+        at = next((i for i, line in enumerate(body) if line.lstrip().startswith("**As landed")), None)
+        while body and not body[-1].strip():
+            body.pop()
+        new = ["**As landed.**", "", *text.splitlines(), ""]
+        body = (body[:at] if at is not None else body + [""]) + new
+        result = "\n".join(lines[:start] + body + lines[end:]) + ("\n" if source.endswith("\n") else "")
+    fd, tmp = tempfile.mkstemp(dir=doc.parent, prefix=f".{doc.name}.")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(result)
+    os.replace(tmp, doc)
+
+
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -725,6 +936,15 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("excerpt")
     p.add_argument("graph", type=Path)
     p.add_argument("id")
+    p = sub.add_parser("prompt")
+    p.add_argument("graph", type=Path)
+    p.add_argument("id")
+    p.add_argument("stage", choices=tuple(STAGE_NUMBER))
+    p.add_argument("--decisions", type=Path)
+    p = sub.add_parser("landed")
+    p.add_argument("graph", type=Path)
+    p.add_argument("id")
+    p.add_argument("report", type=Path)
     args = parser.parse_args(argv)
 
     graph_path: Path = args.graph.resolve()
@@ -765,17 +985,34 @@ def main(argv: list[str] | None = None) -> int:
         if alone:
             print("runs alone: " + ", ".join(alone))
         todo = [n for n in items if n.get("status") not in FINISHED_STATUSES]
-        agents = sum(CHAIN_AGENTS.get(chain_of(n), 0) for n in todo)
-        finals = sum(1 for n in todo if chain_of(n) in ("default", "docs-only"))
+        chains = Counter(chain_of(n) for n in todo)
+        agents = sum(len(CHAIN_STAGES.get(c, ())) * k for c, k in chains.items())
+        finals = sum(k for c, k in chains.items() if "final-review" in CHAIN_STAGES.get(c, ()))
         print(f"agent runs for the {len(todo)} unfinished tasks: {agents} "
-              f"({finals} on the final-review model), before any reopened stage")
+              f"({finals} on the final-review model), before any reopened stage; chains: "
+              + ", ".join(f"{c} {k}" for c, k in sorted(chains.items())))
+        path, longest, total = critical_path(data)
+        print(f"estimated time: {longest:.0f} min on the critical path ({' -> '.join(path) or '-'}); "
+              f"{total:.0f} min if every task ran back to back")
+        hubs = Counter(f for n in todo for f in set(n.get("files") or []))
+        shared = {f: [n["id"] for n in todo if f in (n.get("files") or [])] for f, k in hubs.items() if k > 1}
+        if shared:
+            print("hub files (a seam task that lands their shared interface first lets these tasks run in parallel): "
+                  + "; ".join(f"{f} ({', '.join(ids)})" for f, ids in sorted(shared.items())))
+        todo_ids = {n["id"] for n in todo}
+        layers = [[i for i in layer if i in todo_ids] for layer in waves(data)]
+        layers = [layer for layer in layers if layer]
+        if len(todo) >= 3 and all(len(layer) == 1 for layer in layers):
+            print("warning: the plan is serial; every wave holds one task, so no lanes run in parallel. "
+                  "Look for a seam task (SKILL.md, \"Seams\") before you execute.")
         return 0
     if args.cmd == "next":
         start, hold, slots = next_ready(data)
         open_lanes = [n["id"] for n in by_id(data).values() if n.get("status") in OPEN_STATUSES]
         print(f"free lane slots: {max(slots, 0)}; open lanes: {', '.join(open_lanes) or 'none'}")
         for n in start:
-            print(f"START {n['id']}: {n.get('title', '')} [{n.get('kind')}, {n.get('size')}, chain {chain_of(n)}]")
+            print(f"START {n['id']}: {n.get('title', '')} [{n.get('kind')}, {n.get('size')}, chain {chain_of(n)}: "
+                  f"{', '.join(CHAIN_STAGES.get(chain_of(n), ()))}]")
         for nid, why in hold:
             print(f"HOLD  {nid}: {why}")
         if not start and not open_lanes:
@@ -789,6 +1026,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "lane":
         print(lane_commands(data, graph_path, args.id, args.action))
+        return 0
+    if args.cmd == "prompt":
+        out, launcher = render_prompt(data, graph_path, args.id, args.stage, args.decisions)
+        print(f"# prompt written to {out} ({len(out.read_text(encoding='utf-8'))} chars); give the agent this line:")
+        print(launcher)
+        return 0
+    if args.cmd == "landed":
+        n = by_id(data).get(args.id)
+        if n is None:
+            print(f"unknown node id: {args.id}", file=sys.stderr)
+            return 2
+        text = as_landed_text(args.report)
+        doc, anchor = spec_target(n, data, graph_path)
+        try:
+            apply_landed(doc, anchor, text)
+        except AnchorError as exc:
+            print(f"{args.id}: {exc} in {doc}", file=sys.stderr)
+            return 1
+        print(f"{args.id}: applied {len(text.splitlines())} lines of As landed text to {doc.name}")
         return 0
     if args.cmd == "excerpt":
         n = by_id(data).get(args.id)

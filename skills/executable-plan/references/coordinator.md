@@ -49,25 +49,28 @@ graph's path in the repository.
 ## One iteration
 
 ```
-plan.py next graph.yaml
+plan.py next graph.yaml                      # START lines name each task's chain and stages
 for each START line (the script already applied the cap, files, and alone rules):
     plan.py lane graph.yaml <id> open        # run the printed command; it records status=running
-    build the half-1 prompts (references/chain.md); spec = plan.py excerpt graph.yaml <id>
-    launch half 1 (implement, adversarial review) in the background
-when a half-1 run returns:
+    plan.py prompt graph.yaml <id> implement # launch the printed line in the background
+when a stage returns:
     if stage 1 said BLOCKED: see "Giving up on a task"
-    read report 2's findings; decide each one; stop for the user per the autonomy level
+    render and launch the chain's next stage:
+        light, docs-only: final-review, then integrate
+        default: review; then decide (below); then fix --decisions <file>; then final-review
+when a default chain's review returns:
+    read report 2's findings; decide each by its scope label; stop per the autonomy level
+    write the decisions to <scratch>/<id>_decisions.md
     plan.py set graph.yaml <id> status=review
-    launch half 2 (fix, final review) with the decisions
-when a half-2 run returns:
+when the final review returns:
     plan.py set graph.yaml <id> status=integrating
     plan.py lane graph.yaml <id> integrate   # run the printed command; it ends with status=done
-    on success: plan.py lane graph.yaml <id> close        # run the printed command
-                paste report 4's "As landed" text into the task's section
+    on success: plan.py lane graph.yaml <id> close
+                plan.py landed graph.yaml <id> <scratch>/<id>_report_4.md
                 commit the plan document and graph.yaml: "plan: <id> landed (<commit>)"
     on a gate failure: see "Integration"
 when a measurement task's stage 1 returns:
-    paste its "as landed" text, plan.py set graph.yaml <id> status=done,
+    plan.py landed graph.yaml <id> <scratch>/<id>_report_1.md, plan.py set graph.yaml <id> status=done,
     plan.py lane graph.yaml <id> close, commit the plan document and graph.yaml
 ```
 
@@ -85,28 +88,41 @@ since your last integration and that the main worktree has no change besides
 commit to the lane branch before anything else happens.
 
 Keep your own context small. Read the stage summaries and report 2's
-findings; open the other reports only for a decision that needs them. Between
-events, do the work that depends on nothing: draft the next task's prompts,
-and prepare the plan-document edits for a task that is about to land.
+findings; open the other reports only for a decision that needs them.
+`plan.py prompt` writes each prompt to a file, so a prompt never passes
+through your context either.
 
 ## Owner decisions
 
-A task's `owner_decisions` hold questions only the user can answer. Below
-autonomy 4, `next` holds the task until each has an answer. Ask the user,
-then record the answer by its position in the list, counted from 0:
+A task's `owner_decisions` hold questions only the user can answer. Ask
+them all in one message before the first lane opens, with your recommended
+default for each; an answer at the start costs nothing, and a wrong default
+costs a task. Below autonomy 4, `next` holds a task until each of its
+questions has an answer, and `plan.py prompt` refuses to render its stages.
+Record each answer by its position in the list, counted from 0:
 
 ```
 plan.py set graph.yaml <id> "answer=0:<the user's answer>"
 ```
 
-The answers reach the stages through `{{owner_decisions}}` in the chain
-header, which overrides any default the specification recommends. At
-autonomy 4, fill that placeholder with each default and say it was taken by
-default.
+The answers reach the stages through the prompt header, which overrides any
+default the specification recommends. At autonomy 4 with no answer,
+`plan.py prompt` passes the default and marks it "taken by default". When
+nobody could answer, make each default the most literal reading of the
+specification's words, and list every default taken in the final report.
 
 ## Deciding findings
 
-For each finding in report 2, in number order, write one of:
+Each finding in report 2 carries a scope label (`references/chain.md`,
+"Scope: what a finding may change"). Decide by the label: accept `spec`;
+accept a `defect` whose fix is small and stays in the task's files, and
+defer a larger one to a new task; record `beyond` as a residual without
+fixing it. A fix that removes or changes behavior the specification doesn't
+mention is an owner decision, whatever its label. Apply the same rule to
+every finding: rejecting one finding because "the spec is literal" and
+accepting another that goes beyond the spec is the inconsistency to avoid.
+
+For each finding, in number order, write one of:
 
 - **Accept.** The fix stage applies the recommended fix.
 - **Accept with a change.** State the change in one or two sentences.
@@ -149,9 +165,9 @@ Otherwise it prints one command that stops at its first failure:
 4. Record `status=done commit=<hash>`.
 
 Then close the lane (`plan.py lane graph.yaml <id> close`: remove the
-worktree, delete the branch, clear `lane` and `branch`), paste the "As
-landed" text into the plan document, and commit the plan document and
-`graph.yaml` together. Closing before the commit keeps the committed graph
+worktree, delete the branch, clear `lane` and `branch`), apply the "As
+landed" text with `plan.py landed graph.yaml <id> <report>`, and commit the
+plan document and `graph.yaml` together. Closing before the commit keeps the committed graph
 free of dead lane paths.
 
 A gate that fails at integration ran while other lanes were building, so
@@ -215,10 +231,11 @@ Everything a campaign needs is in the repository, the plan document,
 | Status | State of the lane | What to do |
 | --- | --- | --- |
 | `running` or `review` | Uncommitted changes | A stage died mid-edit. `plan.py lane graph.yaml <id> discard` (saves a patch), then continue below. |
-| `running` | Report files 1 and 2 | Half 1 finished: decide the findings. |
-| `running` | Fewer report files | Rerun the first stage whose report is missing. |
-| `review` | Report files 3 and 4 | Half 2 finished: integrate. |
-| `review` | Fewer report files | Rerun the first stage of half 2 whose report is missing, with the same decisions (they are in the stage 3 prompt you saved, or ask again). |
+| `running` | The chain's last report (4, or 1 for a measurement) | The chain finished: integrate. |
+| `running` | Reports 1 and 2, `default` chain | The review finished: decide the findings. |
+| `running` | Fewer report files | Rerun the first stage whose report is missing (`plan.py prompt` rewrites its prompt). |
+| `review` | Report 4 | The chain finished: integrate. |
+| `review` | Fewer report files | Rerun the first stage whose report is missing; the fix stage takes `--decisions <scratch>/<id>_decisions.md`. |
 | `integrating` | Any | Run `integrate` again. It reports a rebase in progress, finishes a lane that already landed, or prints the full integration. |
 | `done` with `lane` set | Any | Run `close`. |
 

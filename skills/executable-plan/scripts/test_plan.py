@@ -261,6 +261,109 @@ def test_waves_counts_agent_runs(tmp_path, capsys):
     assert "agent runs for the 2 unfinished tasks: 6 (2 on the final-review model)" in out
 
 
+def test_default_chains_follow_kind_and_size():
+    assert plan.chain_of(n("a", size="S")) == "light"
+    assert plan.chain_of(n("a", size="M")) == "default"
+    assert plan.chain_of(n("a", size="S", chain="default")) == "default"
+    assert plan.chain_of(n("a", kind="docs")) == "docs-only"
+    assert plan.chain_of(n("a", kind="measurement")) == "measurement"
+
+
+def test_waves_estimates_time_and_warns_about_a_serial_plan(tmp_path, capsys):
+    nodes = [
+        {"id": "a", "title": "t", "spec": "#a", "kind": "code", "size": "S", "files": ["cli.py"], "status": "planned"},
+        {"id": "b", "title": "t", "spec": "#b", "kind": "code", "size": "M", "deps": ["a"], "files": ["cli.py"], "status": "planned"},
+        {"id": "c", "title": "t", "spec": "#a", "kind": "docs", "size": "S", "deps": ["b"], "files": ["README.md"], "status": "planned"},
+    ]
+    graph_path = make_repo(tmp_path, nodes=nodes)
+    plan.main(["waves", str(graph_path)])
+    out = capsys.readouterr().out
+    # light S: 3 + 1.5; default M: (3 + 4.5 + 3.5 + 1.5) * 2; docs-only S: 3 + 1.5
+    assert "estimated time: 34 min on the critical path (a -> b -> c)" in out
+    assert "hub files" in out and "cli.py (a, b)" in out
+    assert "warning: the plan is serial" in out
+    assert "chains: default 1, docs-only 1, light 1" in out
+
+
+def test_prompt_renders_every_stage_of_a_default_chain(tmp_path):
+    graph_path = make_repo(tmp_path)
+    open_lane(graph_path)
+    decisions = tmp_path / "decisions.md"
+    decisions.write_text("1. Accept.", encoding="utf-8")
+    for stage in ("implement", "review", "fix", "final-review"):
+        out, launcher = plan.render_prompt(plan.load(graph_path), graph_path, "a", stage,
+                                           decisions if stage == "fix" else None)
+        text = out.read_text()
+        assert "{{" not in text and str(out) in launcher
+        assert "You work on task a (first)" in text and '#[ignore = "later"]' in text
+    assert "1. Accept." in (tmp_path / "scratch" / "a" / "a_prompt_3.md").read_text()
+    assert "STAGE 4: FINAL REVIEW.\n" in (tmp_path / "scratch" / "a" / "a_prompt_4.md").read_text()
+
+
+def test_prompt_follows_the_light_chain_and_its_rules(tmp_path):
+    graph_path = make_repo(tmp_path)
+    data = plan.load(graph_path)
+    data["nodes"][0]["size"] = "S"
+    data["nodes"][0]["owner_decisions"] = [{"question": "Q?", "default": "d", "answer": ""}]
+    plan.save(graph_path, data)
+    with pytest.raises(SystemExit, match="owner hasn't answered: Q\\?"):
+        plan.render_prompt(plan.load(graph_path), graph_path, "a", "implement", None)
+    plan.main(["set", str(graph_path), "a", "answer=0:yes"])
+    data = plan.load(graph_path)
+    out, _ = plan.render_prompt(data, graph_path, "a", "implement", None)
+    assert "Q? -> yes" in out.read_text()
+    with pytest.raises(SystemExit, match="`light` chain, which has no review stage"):
+        plan.render_prompt(data, graph_path, "a", "review", None)
+    with pytest.raises(SystemExit, match="needs --decisions"):
+        plan.render_prompt(data, graph_path, "a", "fix", None)
+    out, _ = plan.render_prompt(data, graph_path, "a", "final-review", None)
+    assert "(the only review of this task)" in out.read_text()
+
+
+REPORT = """# a: stage 4
+
+## Gates
+
+all green
+
+## As landed
+
+`words()` shipped as specified.
+
+One residual: curly apostrophes.
+
+## Other
+not this
+"""
+
+
+def test_landed_replaces_the_markdown_as_landed_paragraph(tmp_path):
+    graph_path = make_repo(tmp_path)
+    doc = graph_path.parent / "plan.md"
+    doc.write_text(PLAN_MD.replace("Body of b.", "Body of b.\n\n**As landed.** Empty until the task integrates."))
+    report = tmp_path / "r.md"
+    report.write_text(REPORT)
+    assert plan.main(["landed", str(graph_path), "b", str(report)]) == 0
+    text = plan.section(doc, "b")
+    assert text.endswith("**As landed.**\n\n`words()` shipped as specified.\n\nOne residual: curly apostrophes.")
+    assert "Empty until" not in text and "not this" not in text
+    assert plan.main(["landed", str(graph_path), "a", str(report)]) == 0  # no paragraph yet: appended
+    assert plan.section(doc, "a").endswith("One residual: curly apostrophes.")
+    assert '#[ignore = "later"]' in plan.section(doc, "a")
+
+
+def test_landed_in_html_and_a_report_without_the_heading(tmp_path):
+    doc = tmp_path / "p.html"
+    doc.write_text('<h3 id="a">a</h3><p>spec</p><p><strong>As landed.</strong> Empty.</p><h3 id="b">b</h3>')
+    plan.apply_landed(doc, "a", "Shipped <all>.")
+    text = doc.read_text()
+    assert "<p>Shipped &lt;all&gt;.</p>" in text and "Empty." not in text and '<h3 id="b">b</h3>' in text
+    bad = tmp_path / "r.md"
+    bad.write_text("# report\nno such heading\n")
+    with pytest.raises(SystemExit, match="no \"As landed\" heading"):
+        plan.as_landed_text(bad)
+
+
 # ── lanes ──────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("policy", ["keep", "squash"])

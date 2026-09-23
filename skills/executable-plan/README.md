@@ -47,10 +47,10 @@ request outside a plan (use a review skill for that).
 | Path | Purpose |
 | --- | --- |
 | `SKILL.md` | The skill: the two modes, the vocabulary, the iteration, the autonomy levels, the edge cases. |
-| `scripts/plan.py` | `validate`, `waves`, `next`, `set`, `render`, `lane` (`open`, `integrate`, `close`, `abandon`, `discard`), `excerpt` over `graph.yaml`. Runs only read-only git; prints every command that changes a repository as one `&&` chain. |
+| `scripts/plan.py` | `validate`, `waves`, `next`, `set`, `render`, `lane` (`open`, `integrate`, `close`, `abandon`, `discard`), `excerpt`, `prompt`, `landed` over `graph.yaml`. Runs only read-only git; prints every command that changes a repository as one `&&` chain. |
 | `scripts/test_plan.py` | Tests for `plan.py`: anchors, validation, scheduling, concurrent writes, and full lanes (land, crash and recover, abandon mid-rebase) in temporary git repositories. `uv run scripts/test_plan.py`. Agents never need it. |
 | `references/graph-schema.md` | Every field of `graph.yaml`, the anchor rules, the derived facts, and a full example. Read while drafting. |
-| `references/chain.md` | The four stage prompts as templates with placeholders, the decision step between the halves, reopening a lane, and how to run a half with or without a workflow tool. Read before the first lane. |
+| `references/chain.md` | The chains, the scope labels for findings, and the stage prompt templates that `plan.py prompt` renders (fenced as `template:<name>`), plus reopening a lane and running a chain with or without a workflow tool. Read before the first lane. |
 | `references/coordinator.md` | The coordinator's procedure: pre-flight, the iteration, owner decisions, deciding findings, integration, the conflict rules, giving up, resuming, the failure cases, the final report. Read before the first iteration. |
 | `assets/graph-template.yaml` | A commented skeleton of `graph.yaml`. |
 | `assets/plan-template.md` | A plan document skeleton in Markdown, with the `<!-- task: id -->` marker convention. |
@@ -113,6 +113,20 @@ its branch.
 update: a lane's `running` status vanished and its files stopped excluding
 other tasks. `set` now takes a lock in the git directory and writes through a
 temporary file. It uses `ruamel.yaml`, so comments the drafter wrote survive.
+
+**What the behavioral test taught.** The same prompt ran on a four-item
+backlog with the skill and without it. Both arms passed 9 of 11 hidden
+acceptance tests, failing on the same ambiguous sentence. The skill's arm
+cost 8× as much and took 11× as long: every S task ran the full four-stage
+chain on the strongest model, the plan was a straight line of dependencies,
+and the reviewers' mostly beyond-spec findings were accepted. The arm
+without the skill landed a small seam commit first and ran two tasks in
+parallel. The changes that followed: S tasks default to the `light` chain;
+the drafting guidance prefers a cheaper implementing model; `waves` estimates
+time, names hub files, and warns about serial plans, with a "Seams" section
+in `SKILL.md`; findings carry scope labels that decide them; owner questions
+are asked before execution; and `plan.py prompt` and `plan.py landed` replace
+two error-prone manual steps.
 
 **What the adversarial review of this skill found.** An Opus review at xhigh
 effort walked the protocol literally in scratch repositories. Besides the

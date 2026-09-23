@@ -12,13 +12,14 @@ plan:
   lane_cap: 3            # the machine sets this: one full build per lane
   autonomy: 2            # 0 full control … 2 default (P1s, decisions, destructive) … 4 autonomous
   commit_policy: keep    # keep | squash
-  models:
-    implement: <model id>
-    review: <model id>
-    fix: <model id>
-    final_review: <model id>
+  models:                # a cheaper model builds; the strongest one reviews
+    implement: <model id, e.g. sonnet>
+    review: <model id, e.g. opus>
+    fix: <model id, e.g. sonnet>
+    final_review: <model id, e.g. opus>
   effort:
-    final_review: xhigh
+    final_review: high
+  # stage_minutes: {implement: 3, review: 4.5, fix: 3.5, final_review: 1.5}   # S-task minutes for `waves`
   commands:
     build: <command>
     test: <command>
@@ -41,7 +42,7 @@ nodes:
     title: <one line>
     spec: "#<short-id>"  # or "<other document>#<anchor>"
     kind: code           # code | docs | plan | measurement
-    # chain: none        # optional override of the chain `kind` implies: default | docs-only | none
+    # chain: default     # override: default | light | docs-only | none (S code runs light, M/L default)
     size: M              # S | M | L
     deps: []             # hard: must be done first
     soft_deps: []        # preferred order

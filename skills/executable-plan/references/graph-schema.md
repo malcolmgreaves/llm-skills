@@ -29,8 +29,9 @@ nodes:     # the tasks (a list)
 | `lane_cap` | integer ≥ 1 | yes | The most lanes that run at one time. Each lane builds with every core and owns a build directory, so the machine sets this. |
 | `autonomy` | integer 0–4 | yes | When the coordinator stops for the user. See `SKILL.md`. |
 | `commit_policy` | `keep` or `squash` | yes | Whether a lane's commits land as they are (fast-forward) or as one commit. |
-| `models` | map | yes | `implement`, `review`, `fix`, `final_review`: the model id for each chain stage. |
-| `effort` | map | no | Per-stage effort override, for example `final_review: xhigh`. |
+| `models` | map | yes | `implement`, `review`, `fix`, `final_review`: the model id for each chain stage. Default to a cheaper model for `implement` and `fix` and the strongest for `review` and `final_review`. |
+| `effort` | map | no | Per-stage effort override, for example `final_review: high`. |
+| `stage_minutes` | map | no | Minutes of agent time per stage for an S task (`implement`, `review`, `fix`, `final_review`), for the time estimate in `waves`. Defaults: 3, 4.5, 3.5, 1.5, from measured runs. M doubles them, L quadruples them. |
 | `commands` | map | no | `build`, `test`, `lint`, `check`, `run`: the project's commands, named in the lane prompts. |
 | `gates` | list of strings | yes | The commands the coordinator runs at integration, in order. A lane runs them too before it reports. Each gate is a string; quote one that contains `: `. |
 | `guidelines` | list of paths | no | Style, design, and architecture files every agent reads first. |
@@ -44,8 +45,8 @@ nodes:     # the tasks (a list)
 | `id` | string | yes | Unique. Letters, digits, `-`, `_`; quote an all-digit id. It is the anchor id, the branch suffix, and the worktree name, so keep it short. |
 | `title` | string | yes | One line. |
 | `spec` | string | yes | Where the task's section lives: `#<anchor>` in `plan.spec`, or `<path>#<anchor>` in another document. `plan.py validate` confirms the anchor exists and is unambiguous, and that no two nodes share a spec. |
-| `kind` | `code`, `docs`, `plan`, `measurement` | yes | `code` runs the full chain. `docs` and `plan` run `docs-only`. `measurement` runs one implement stage that reports numbers and changes no code. |
-| `chain` | `default`, `docs-only`, `none` | no | Overrides the chain `kind` implies. `none` means the coordinator does the task itself (a plan edit, a merge). |
+| `kind` | `code`, `docs`, `plan`, `measurement` | yes | Picks the default chain with `size`: `code` runs `light` at size S and `default` at M or L; `docs` and `plan` run `docs-only`; `measurement` runs one stage that reports numbers and changes no code. |
+| `chain` | `default`, `light`, `docs-only`, `none` | no | Overrides the default chain (`references/chain.md`, "The chains"). Set `default` on an S task whose wrong result would be costly; `none` means the coordinator does the task itself (a seam, a plan edit, a merge). |
 | `size` | `S`, `M`, `L` | yes | S: under two hours of agent time. M: one chain of a few hours. L: the largest single chain you allow. |
 | `deps` | list of ids | no | Hard dependencies. The task starts only when each one is `done`. |
 | `soft_deps` | list of ids | no | Preferred order. The task doesn't start while one of them is running or starting in the same round; it doesn't wait for one that can't start yet. |
@@ -89,9 +90,13 @@ reports the mismatch.
   lanes. The first to start holds the other.
 - **Waves**: the topological layers of the hard dependencies, which is the
   most concurrency the plan allows before exclusions and the cap.
-- **Agent runs**: 4 per `default` chain, 2 per `docs-only`, 1 per
-  `measurement`, 0 per `none`, before any reopened stage. `waves` prints
-  the total for the unfinished tasks.
+- **Agent runs**: 4 per `default` chain, 2 per `light` or `docs-only`, 1
+  per `measurement`, 0 per `none`, before any reopened stage.
+- **Time**: each task's chain stages times `stage_minutes` and the size
+  factor; the critical path is the longest chain of hard dependencies.
+- **Hub files and serial plans**: `waves` names each file that several
+  unfinished tasks list, and warns when every wave holds one task. Both are
+  the cue for a seam task (`SKILL.md`, "Seams").
 - **Ready set**: status `planned`; `deps` all `done` or `skipped`; no
   unanswered owner decision at autonomy 3 or below; no file shared with an
   open lane or another task starting this round; no soft dependency running
@@ -113,12 +118,12 @@ plan:
   autonomy: 2
   commit_policy: keep
   models:
-    implement: claude-opus-5-5
-    review: claude-opus-5-5
-    fix: claude-opus-5-5
-    final_review: fable
+    implement: sonnet
+    review: opus
+    fix: sonnet
+    final_review: opus
   effort:
-    final_review: xhigh
+    final_review: high
   commands:
     build: cargo build --workspace
     test: cargo test --no-fail-fast -p <crate>
