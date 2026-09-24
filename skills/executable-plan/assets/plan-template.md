@@ -47,8 +47,9 @@ reason.
 **Owner decisions.** A question only the owner can answer, and the default
 you recommend. Omit the heading if there is none.
 
-**As landed.** Empty until the task integrates. The coordinator pastes the
-final review's text here: what shipped, deviations, residuals, measurements.
+**As landed.** Empty until the task integrates. `plan.py landed` replaces
+this paragraph with the workflow's last report: what shipped, deviations,
+residuals, measurements.
 
 ### `<id-2>`: <title>
 <!-- task: <id-2> -->

@@ -23,17 +23,20 @@ nodes:     # the tasks (a list)
 | `title` | string | yes | The plan's name. |
 | `spec` | path | yes | The plan document, relative to `graph.yaml`. `.md` or `.html`. A node's `spec` of the form `#id` resolves against this file. |
 | `integration_branch` | string | yes | The branch every lane starts from and lands on. |
-| `worktree_root` | path | yes | Lanes are created at `<worktree_root>/<id>`. `~` expands; a relative path is relative to `graph.yaml`. Outside the repository is simplest; inside it, add it to `.git/info/exclude` (`validate` warns). |
-| `scratch_root` | path | yes | Each lane's scratch directory is `<scratch_root>/<id>`: stage reports, diffs, and saved patches. `~` expands; a relative path is relative to `graph.yaml`. A lane's build directory is not here (it stays in the worktree). |
+| `worktree_root` | path | yes | Lanes are created at `<worktree_root>/<id>`. `~` expands; a relative path is relative to `graph.yaml`. Default to a directory next to the repository (`../<repo>-lanes/worktrees`), or under `$TMPDIR` in a sandbox. Inside the repository, add it to `.git/info/exclude` (`validate` warns). |
+| `scratch_root` | path | yes | Each lane's scratch partition is `<scratch_root>/<id>`: prompts, reports, decisions, the brief, saved patches, and one `stage-<name>` temporary directory per prompt. Default to `../<repo>-lanes/scratch`. `plan.py clean` reclaims it. |
 | `branch_prefix` | string | yes | Lane branches are `<branch_prefix><id>`, for example `lane/`. |
 | `lane_cap` | integer ≥ 1 | yes | The most lanes that run at one time. Each lane builds with every core and owns a build directory, so the machine sets this. |
 | `autonomy` | integer 0–4 | yes | When the coordinator stops for the user. See `SKILL.md`. |
 | `commit_policy` | `keep` or `squash` | yes | Whether a lane's commits land as they are (fast-forward) or as one commit. |
-| `models` | map | yes | `implement`, `review`, `fix`, `final_review`: the model id for each chain stage. Default to a cheaper model for `implement` and `fix` and the strongest for `review` and `final_review`. |
-| `effort` | map | no | Per-stage effort override, for example `final_review: high`. |
-| `stage_minutes` | map | no | Minutes of agent time per stage for an S task (`implement`, `review`, `fix`, `final_review`), for the time estimate in `waves`. Defaults: 3, 4.5, 3.5, 1.5, from measured runs. M doubles them, L quadruples them. |
+| `workflow` | map | no | Size (`S`, `M`, `L`) to the list of stages its tasks run, in the order `implement`, `review`, `second_review`, `fix`; `review` is required. Defaults: S `[implement, review]`; M and L `[implement, review, second_review]`. The user picks these at draft time, including whether M and L end with `fix`. |
+| `models` | map | yes | Stage to model id, for every stage the workflows use: `implement`, `review`, `second_review`, `fix`, `delegate`. The user picks them; `validate` refuses a missing one. |
+| `effort` | map | no | Stage to the requested effort: `low`, `medium`, `high`, `xhigh`, `max`. Advisory where the runtime can't set it (the Agent tool can't); the log records what was applied. |
+| `coordinator` | `full`, `merge`, `delegate` | no | How much the coordinator reviews (`references/coordinator.md`). Default `full`. `delegate` adds a `delegate` stage to every workflow. |
+| `stage_minutes` | map | no | Model-neutral minutes per stage for an S task, used by `waves` until this repository has measured timings. Defaults: implement 3, review 3.5, second_review 3, fix 2.5, delegate 2.5. M doubles them, L quadruples them. |
+| `timings` | path | no | Where measured stage timings are kept. Default: `executable-plan/timings.jsonl` in the repository's git directory, shared by every worktree and every plan in the repository. |
 | `commands` | map | no | `build`, `test`, `lint`, `check`, `run`: the project's commands, named in the lane prompts. |
-| `gates` | list of strings | yes | The commands the coordinator runs at integration, in order. A lane runs them too before it reports. Each gate is a string; quote one that contains `: `. |
+| `gates` | list of strings | yes | The commands every stage runs, and landing runs again, in order. Each gate is a string; quote one that contains `: `. |
 | `guidelines` | list of paths | no | Style, design, and architecture files every agent reads first. |
 | `prior_plans` | list of paths | no | Plans the tasks cite. |
 | `notes` | string | no | Free text for the coordinator (machine limits, disk rules, anything that does not fit a field). |
@@ -45,19 +48,20 @@ nodes:     # the tasks (a list)
 | `id` | string | yes | Unique. Letters, digits, `-`, `_`; quote an all-digit id. It is the anchor id, the branch suffix, and the worktree name, so keep it short. |
 | `title` | string | yes | One line. |
 | `spec` | string | yes | Where the task's section lives: `#<anchor>` in `plan.spec`, or `<path>#<anchor>` in another document. `plan.py validate` confirms the anchor exists and is unambiguous, and that no two nodes share a spec. |
-| `kind` | `code`, `docs`, `plan`, `measurement` | yes | Picks the default chain with `size`: `code` runs `light` at size S and `default` at M or L; `docs` and `plan` run `docs-only`; `measurement` runs one stage that reports numbers and changes no code. |
-| `chain` | `default`, `light`, `docs-only`, `none` | no | Overrides the default chain (`references/chain.md`, "The chains"). Set `default` on an S task whose wrong result would be costly; `none` means the coordinator does the task itself (a seam, a plan edit, a merge). |
-| `size` | `S`, `M`, `L` | yes | S: under two hours of agent time. M: one chain of a few hours. L: the largest single chain you allow. |
+| `kind` | `code`, `docs`, `plan`, `measurement` | yes | `code` runs its size's workflow; `docs` and `plan` run implement then review; `measurement` runs implement alone, changes no code, and runs alone. |
+| `size` | `S`, `M`, `L` | yes | Picks the workflow. S: a small, contained change. M: several files or a new component. L: the largest single task you allow. |
+| `escalate` | enum | no | Runs the workflow of the next size up. Only `untrusted-input`, `persistence`, `security`, `concurrency`, or `breaking-interface` (a breaking change to an existing public interface). |
+| `chain` | `none` | no | The coordinator does the task itself, with no lane (a seam, a plan edit, a merge). |
 | `deps` | list of ids | no | Hard dependencies. The task starts only when each one is `done`. |
 | `soft_deps` | list of ids | no | Preferred order. The task doesn't start while one of them is running or starting in the same round; it doesn't wait for one that can't start yet. |
-| `files` | list of paths | code: yes | Every existing file the task changes, tests included; new files may be listed too. Two tasks with a common file never run at the same time. The stage prompts forbid editing an existing file outside the list, and `integrate` names any unlisted file the lane changed. |
+| `files` | list of paths | code: yes | The files the task is expected to change, tests included. A scheduling hint: two tasks with a common file never run at the same time. Agents may change other files when the work needs them; they report each one, and landing names it so the coordinator can add it. |
 | `alone` | bool | no | The task runs with no other lane open, and no lane opens until it has run. For a refactor that moves many files. Defaults to `true` for a `measurement` task, `false` otherwise. |
-| `owner_decisions` | list of maps | no | Each item: `question`, `default`, `answer` (empty until the user answers). At autonomy 4 the coordinator takes `default`; at 3 and below the task waits until `answer` is set. Record an answer with `plan.py set graph.yaml <id> "answer=<index from 0>:<text>"`. |
-| `status` | enum | yes | `planned` (not started; `next` decides when it can start), `running` (lane open, first half), `review` (findings decided, second half), `integrating`, `done`, `blocked` (abandoned; its dependents wait), `skipped` (counts as done for its dependents). `plan.py set` changes it. |
+| `owner_decisions` | list of maps | no | Each item: `question`, `default`, `answer` (empty until the user answers). At autonomy 4 the default is taken and reported; at 3 and below the task waits until `answer` is set. Record an answer with `plan.py set graph.yaml <id> "answer=<index from 0>:<text>"`. |
+| `status` | enum | yes | `planned` (not started), `running` (the workflow is running), `review` (the coordinator is deciding, or the fix stage is running), `waiting` (an owner-level question is with the user; the lane keeps its slot), `integrating`, `done`, `blocked` (abandoned; its dependents wait), `skipped` (counts as done for its dependents). `plan.py set` changes it. |
 | `lane` | path | runtime | The worktree path while the lane is open; `close` and `abandon` clear it. |
 | `branch` | string | runtime | The lane branch while the lane is open; after `abandon`, `abandoned/<id>`, which keeps the lane's commits. |
 | `commit` | string | runtime | The integration commit once `done`. |
-| `log` | list of strings | runtime | `plan.py set` appends one timestamped line per change. |
+| `log` | list of strings | runtime | One timestamped line per change. `plan.py prompt` adds a line for each prompt it starts (`stage=<name> start model=… effort=… applied=…`); those lines and the report files give each stage's duration. |
 
 ## Anchors
 
@@ -88,18 +92,23 @@ reports the mismatch.
 
 - **Exclusion**: two nodes whose `files` intersect are mutually exclusive
   lanes. The first to start holds the other.
-- **Waves**: the topological layers of the hard dependencies, which is the
-  most concurrency the plan allows before exclusions and the cap.
-- **Agent runs**: 4 per `default` chain, 2 per `light` or `docs-only`, 1
-  per `measurement`, 0 per `none`, before any reopened stage.
-- **Time**: each task's chain stages times `stage_minutes` and the size
-  factor; the critical path is the longest chain of hard dependencies.
+- **Waves**: the topological layers of the hard dependencies.
+- **Workflow**: `plan.workflow[size]` (the next size up with `escalate`),
+  plus `delegate` in that coordinator mode.
+- **Agents**: one per workflow stage (a review is one agent given two
+  prompts), plus a fix stage only when findings are accepted.
+- **Time**: `waves` runs the real scheduler (dependencies, file exclusions,
+  `alone`, the lane cap) over estimated stage durations: the median of this
+  repository's measured timings for the stage, size, model, and effort, else
+  `stage_minutes`. It prints the finish time and the most lanes open at once.
 - **Hub files and serial plans**: `waves` names each file that several
-  unfinished tasks list, and warns when every wave holds one task. Both are
-  the cue for a seam task (`SKILL.md`, "Seams").
+  unfinished tasks list, and warns when the schedule never runs two lanes at
+  once. Both are the cue for a seam task (`SKILL.md`, "Seams").
+- **Changed files**: `next` also excludes on the files each open lane has
+  actually changed so far.
 - **Ready set**: status `planned`; `deps` all `done` or `skipped`; no
   unanswered owner decision at autonomy 3 or below; no file shared with an
-  open lane or another task starting this round; no soft dependency running
+  open lane (listed or already changed) or another task starting this round; no soft dependency running
   or starting; a free slot under `lane_cap`. An `alone` task overrides the
   rest: when one is ready, it starts by itself if no lane is open, and
   otherwise nothing starts until the open lanes close.
@@ -111,19 +120,27 @@ plan:
   title: Remaining work, autumn campaign
   spec: remaining_work.html
   integration_branch: main
-  worktree_root: ~/.local/state/git/worktrees/myrepo/lane
-  scratch_root: /Volumes/scratch/lanes
+  worktree_root: ../myrepo-lanes/worktrees
+  scratch_root: ../myrepo-lanes/scratch
   branch_prefix: lane/
   lane_cap: 3
   autonomy: 2
   commit_policy: keep
+  coordinator: full
+  workflow:
+    S: [implement, review]
+    M: [implement, review, second_review]
+    L: [implement, review, second_review, fix]
   models:
     implement: sonnet
     review: opus
+    second_review: opus
     fix: sonnet
-    final_review: opus
   effort:
-    final_review: high
+    implement: medium
+    review: high
+    second_review: xhigh
+    fix: high
   commands:
     build: cargo build --workspace
     test: cargo test --no-fail-fast -p <crate>
@@ -140,7 +157,7 @@ plan:
   prior_plans:
     - plans/master.html
   notes: >-
-    Each lane's build directory reaches 20 GB; clean it after integration.
+    Each lane's build directory reaches 20 GB; landing removes it with the worktree.
 nodes:
   - id: tags
     title: Lightweight tags
@@ -158,6 +175,7 @@ nodes:
     spec: "#conflict-dir"
     kind: code
     size: M
+    escalate: persistence
     deps: [tags]
     files:
       - crates/repo/src/schema.rs

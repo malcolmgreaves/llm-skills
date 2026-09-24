@@ -6,22 +6,27 @@
 """Operate on an executable plan's graph.yaml.
 
 Usage:
-    uv run plan.py validate GRAPH              # schema, cycles, anchors, files
-    uv run plan.py waves GRAPH                 # the concurrent layers, exclusions, and agent count
+    uv run plan.py validate GRAPH              # schema, workflows, cycles, anchors
+    uv run plan.py waves GRAPH                 # waves, exclusions, workflows, agent runs, simulated time
     uv run plan.py next GRAPH                  # what can start now, and why the rest waits
     uv run plan.py set GRAPH ID key=value ...  # status=, lane=, branch=, commit=, log=, answer=N:text
     uv run plan.py render GRAPH                # a status table (Markdown)
     uv run plan.py lane GRAPH ID ACTION        # print the shell command for a lane action:
-                                               #   open, integrate, close, abandon, discard
+                                               #   open, integrate, close, land, abandon, discard
     uv run plan.py excerpt GRAPH ID            # the task's section from the plan document
-    uv run plan.py prompt GRAPH ID STAGE [--decisions FILE]
-                                               # render a stage prompt to the lane's scratch
-                                               #   directory; print the launcher line
-    uv run plan.py landed GRAPH ID REPORT      # paste a report's "As landed" text into the plan
+    uv run plan.py prompt GRAPH ID STAGE [--part report|fix] [--decisions FILE] [--via agent|workflow]
+                                               # render a stage prompt; log the stage's start
+    uv run plan.py context GRAPH ID [--note FILE]   # write the coordinator's brief for the task
+    uv run plan.py findings GRAPH ID           # Beyond, Needs owner, and owner-level decisions
+    uv run plan.py landed GRAPH ID [REPORT]    # paste the "As landed" text into the plan
+    uv run plan.py report GRAPH                # write the final report next to graph.yaml
+    uv run plan.py clean GRAPH [ID]            # reclaim scratch space (a lane's, or the campaign's)
 
 The script runs only read-only git commands. It prints every command that
 changes a repository for the coordinator to run, as one `&&` chain that
-stops at the first failure, so each destructive step stays visible.
+stops at the first failure, so each destructive step stays visible. The only
+files it writes itself are graph.yaml, the plan document, prompt and brief
+files in scratch, the report, and the timings file; `clean` removes scratch.
 """
 
 from __future__ import annotations
@@ -29,9 +34,12 @@ from __future__ import annotations
 import argparse
 import fcntl
 import html as html_lib
+import json
 import os
 import re
 import shlex
+import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -43,33 +51,35 @@ from pathlib import Path
 
 from ruamel.yaml import YAML
 
-STATUSES = ("planned", "running", "review", "integrating", "done", "blocked", "skipped")
-OPEN_STATUSES = ("running", "review", "integrating")
+STATUSES = ("planned", "running", "review", "waiting", "integrating", "done", "blocked", "skipped")
+OPEN_STATUSES = ("running", "review", "waiting", "integrating")
 FINISHED_STATUSES = ("done", "skipped")
 KINDS = ("code", "docs", "plan", "measurement")
-CHAINS = ("default", "light", "docs-only", "none")
 SIZES = ("S", "M", "L")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 PLAN_REQUIRED = (
     "title", "spec", "integration_branch", "worktree_root", "scratch_root",
     "branch_prefix", "lane_cap", "autonomy", "commit_policy", "models", "gates",
 )
-MODEL_STAGES = ("implement", "review", "fix", "final_review")
-# The stages of each chain; `measurement` is the implied chain of a measurement task.
-CHAIN_STAGES = {
-    "default": ("implement", "review", "fix", "final-review"),
-    "light": ("implement", "final-review"),
-    "docs-only": ("implement", "final-review"),
-    "measurement": ("implement",),
-    "none": (),
+# Stages in the only order a workflow may use them. `delegate` is added by the coordinator mode.
+WORKFLOW_STAGES = ("implement", "review", "second_review", "fix")
+STAGES = WORKFLOW_STAGES + ("delegate",)
+TWO_PART = ("review", "second_review")  # a report prompt, then a fix prompt, to the same agent
+DEFAULT_WORKFLOW = {
+    "S": ["implement", "review"],
+    "M": ["implement", "review", "second_review"],
+    "L": ["implement", "review", "second_review"],
 }
-STAGE_NUMBER = {"implement": 1, "review": 2, "fix": 3, "final-review": 4}
-# Minutes of agent time per stage for an S task, from measured runs; M doubles, L quadruples.
-# plan.stage_minutes overrides them (keys: implement, review, fix, final_review).
-STAGE_MINUTES = {"implement": 3.0, "review": 4.5, "fix": 3.5, "final-review": 1.5}
+COORDINATOR_MODES = ("full", "merge", "delegate")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+ESCALATIONS = ("untrusted-input", "persistence", "security", "concurrency", "breaking-interface")
+# Model-neutral minutes of agent time per stage for an S task, until measured timings exist.
+# M doubles them, L quadruples them. plan.stage_minutes overrides them.
+STAGE_MINUTES = {"implement": 3.0, "review": 3.5, "second_review": 3.0, "fix": 2.5, "delegate": 2.5}
 SIZE_FACTOR = {"S": 1, "M": 2, "L": 4}
 SELF = Path(__file__).resolve()
-CHAIN_DOC = SELF.parent.parent / "references" / "chain.md"
+TEMPLATES = SELF.parent.parent / "assets" / "stage-templates.md"
+REPORT_NAME = "report.md"
 
 _yaml = YAML()  # round-trip mode: keeps the comments, quotes, and layout the drafter wrote
 _yaml.preserve_quotes = True  # an unquoted `yes` is a boolean to YAML 1.1 readers
@@ -98,26 +108,32 @@ def dump(data: dict) -> str:
     return buf.getvalue()
 
 
-def save(graph_path: Path, data: dict) -> None:
-    """Write atomically, so a reader never sees half a file."""
-    fd, tmp = tempfile.mkstemp(dir=graph_path.parent, prefix=f".{graph_path.name}.")
+def _write_atomic(path: Path, text: str) -> None:
+    """Write through a temporary file, so a reader never sees half a file."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(dump(data))
-        os.replace(tmp, graph_path)
+            fh.write(text)
+        os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
 
 
+def save(graph_path: Path, data: dict) -> None:
+    _write_atomic(graph_path, dump(data))
+
+
+def git_dir(graph_path: Path) -> Path | None:
+    common = _git("-C", str(graph_path.parent), "rev-parse", "--git-common-dir")
+    return (graph_path.parent / common).resolve() if common else None
+
+
 @contextmanager
 def locked(graph_path: Path):
     """Serialize read-modify-write of the graph across processes."""
-    common = _git("-C", str(graph_path.parent), "rev-parse", "--git-common-dir")
-    if common:
-        lock = (graph_path.parent / common / "executable-plan.lock").resolve()
-    else:
-        lock = graph_path.with_name(f".{graph_path.name}.lock")
+    gd = git_dir(graph_path)
+    lock = gd / "executable-plan.lock" if gd else graph_path.with_name(f".{graph_path.name}.lock")
     with open(lock, "a") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         yield
@@ -127,30 +143,75 @@ def by_id(data: dict) -> dict[str, dict]:
     return {n["id"]: n for n in data["nodes"] if isinstance(n, dict) and isinstance(n.get("id"), str)}
 
 
-def chain_of(node: dict) -> str:
-    """The node's chain: its `chain` field, or the default for its kind and size."""
-    if node.get("chain"):
-        return str(node["chain"])
+def now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# ── workflows ──────────────────────────────────────────────────────────────────
+
+def effective_size(node: dict) -> str:
+    """The node's size, one step up when it names an escalation reason."""
+    size = str(node.get("size", "M"))
+    if node.get("escalate") and size in SIZES:
+        return SIZES[min(SIZES.index(size) + 1, len(SIZES) - 1)]
+    return size
+
+
+def workflow_of(node: dict, plan: dict) -> list[str]:
+    """The stages the node runs, in order."""
+    if node.get("chain") == "none":
+        return []
     kind = node.get("kind")
-    if kind in ("docs", "plan"):
-        return "docs-only"
     if kind == "measurement":
-        return "measurement"
-    return "light" if node.get("size") == "S" else "default"
+        return ["implement"]
+    if kind in ("docs", "plan"):
+        stages = ["implement", "review"]
+    else:
+        table = {**DEFAULT_WORKFLOW, **{str(k): list(v) for k, v in (plan.get("workflow") or {}).items()}}
+        stages = list(table.get(effective_size(node), DEFAULT_WORKFLOW["M"]))
+    if plan.get("coordinator", "full") == "delegate":
+        stages.append("delegate")
+    return stages
 
 
-def task_minutes(node: dict, plan: dict) -> float:
-    """Estimated agent minutes for the node's whole chain."""
-    override = {k.replace("_", "-"): float(v) for k, v in (plan.get("stage_minutes") or {}).items()}
-    per_stage = {**STAGE_MINUTES, **override}
-    factor = SIZE_FACTOR.get(node.get("size"), 1)
-    return sum(per_stage[s] for s in CHAIN_STAGES.get(chain_of(node), ())) * factor
+def last_review(stages: list[str]) -> str | None:
+    return next((s for s in ("second_review", "review") if s in stages), None)
+
+
+def decider(plan: dict, stages: list[str]) -> str:
+    """Who makes owner-level calls at autonomy 4: a stage name, or `coordinator`."""
+    if "delegate" in stages:
+        return "delegate"
+    if "fix" in stages:
+        return "fix"
+    if plan.get("coordinator", "full") == "full":
+        return "coordinator"
+    return last_review(stages) or "implement"
+
+
+def part_names(stage: str) -> list[str]:
+    return [f"{stage}-report", f"{stage}-fix"] if stage in TWO_PART else [stage]
+
+
+def prompt_name(stage: str, part: str | None) -> str:
+    return f"{stage}-{part or 'report'}" if stage in TWO_PART else stage
+
+
+def model_for(plan: dict, stage: str) -> str:
+    models = plan.get("models") or {}
+    return str(models.get(stage) or models.get("implement") or "")
+
+
+def effort_for(plan: dict, stage: str) -> str:
+    return str((plan.get("effort") or {}).get(stage) or "")
 
 
 def runs_alone(node: dict) -> bool:
     # A measurement runs alone unless told otherwise: other lanes' builds skew its numbers.
     return bool(node.get("alone", node.get("kind") == "measurement"))
 
+
+# ── paths ──────────────────────────────────────────────────────────────────────
 
 def spec_target(node: dict, data: dict, graph_path: Path) -> tuple[Path, str]:
     """Resolve a node's `spec` to (document path, anchor)."""
@@ -175,6 +236,26 @@ def root_dir(plan: dict, key: str, graph_path: Path) -> Path:
     """A directory setting, with `~` expanded and a relative path taken from graph.yaml's directory."""
     path = Path(os.path.expanduser(str(plan[key])))
     return (path if path.is_absolute() else graph_path.parent / path).resolve()
+
+
+def lane_scratch(plan: dict, graph_path: Path, nid: str) -> Path:
+    return root_dir(plan, "scratch_root", graph_path) / nid
+
+
+def report_file(scratch: Path, nid: str, name: str) -> Path:
+    return scratch / f"{nid}_{name}.md"
+
+
+def stage_tmp(scratch: Path, name: str) -> Path:
+    return scratch / f"stage-{name}"
+
+
+def timings_file(graph_path: Path, plan: dict) -> Path:
+    """One timings file per repository: in the git directory, shared by every worktree."""
+    if plan.get("timings"):
+        return resolve_doc(str(plan["timings"]), graph_path)
+    gd = git_dir(graph_path)
+    return (gd / "executable-plan" / "timings.jsonl") if gd else graph_path.parent / ".timings.jsonl"
 
 
 # ── anchors and excerpts ───────────────────────────────────────────────────────
@@ -329,6 +410,26 @@ def section(doc: Path, anchor: str) -> str:
 
 # ── validation ─────────────────────────────────────────────────────────────────
 
+def _check_workflow(size: str, stages: object) -> list[str]:
+    where = f"plan.workflow.{size}"
+    if size not in SIZES:
+        return [f"{where}: the size must be one of {SIZES}"]
+    if not isinstance(stages, list) or not stages:
+        return [f"{where} must be a non-empty list of stages"]
+    errors = [f"{where}: unknown stage {s!r}; use {', '.join(WORKFLOW_STAGES)}"
+              for s in stages if s not in WORKFLOW_STAGES]
+    if errors:
+        return errors
+    if stages[0] != "implement":
+        errors.append(f"{where} must start with implement")
+    order = [WORKFLOW_STAGES.index(s) for s in stages]
+    if order != sorted(set(order)):
+        errors.append(f"{where}: stages must appear once each, in the order {' -> '.join(WORKFLOW_STAGES)}")
+    if "review" not in stages:
+        errors.append(f"{where} must include review: every task gets one review-and-fix")
+    return errors
+
+
 def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -347,10 +448,23 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
         errors.append("plan.autonomy must be an integer from 0 to 4")
     if plan.get("commit_policy") not in ("keep", "squash"):
         errors.append("plan.commit_policy must be 'keep' or 'squash'")
-    models = plan.get("models") or {}
-    for stage in MODEL_STAGES:
-        if not models.get(stage):
-            errors.append(f"plan.models.{stage} is missing")
+    if plan.get("coordinator", "full") not in COORDINATOR_MODES:
+        errors.append(f"plan.coordinator must be one of {COORDINATOR_MODES}")
+    workflow = plan.get("workflow")
+    if workflow is not None:
+        if not isinstance(workflow, dict):
+            errors.append("plan.workflow must map sizes (S, M, L) to lists of stages")
+        else:
+            for size, stages in workflow.items():
+                errors += _check_workflow(str(size), stages)
+    for stage, level in (plan.get("effort") or {}).items():
+        if stage not in STAGES:
+            errors.append(f"plan.effort: unknown stage {stage!r}")
+        elif str(level) not in EFFORTS:
+            warnings.append(f"plan.effort.{stage}: {level!r} is not one of {EFFORTS}")
+    for stage in (plan.get("models") or {}):
+        if stage not in STAGES:
+            errors.append(f"plan.models: unknown stage {stage!r}; use {', '.join(STAGES)}")
     gates = plan.get("gates")
     if not isinstance(gates, list) or not gates:
         errors.append("plan.gates must be a non-empty list of commands")
@@ -381,6 +495,7 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
         errors.append(f"duplicate node id: {d}")
     known = set(str_ids)
     specs: dict[tuple[str, str], str] = {}
+    used_stages: set[str] = set()
     for n in nodes:
         nid = str(n.get("id", "?"))
         if isinstance(n.get("id"), str) and not ID_RE.match(nid):
@@ -390,8 +505,11 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
                 errors.append(f"{nid}: {key} is missing")
         if n.get("kind") not in KINDS:
             errors.append(f"{nid}: kind must be one of {KINDS}")
-        if n.get("chain", "default") not in CHAINS:
-            errors.append(f"{nid}: chain must be one of {CHAINS}")
+        if "chain" in n and n.get("chain") != "none":
+            errors.append(f"{nid}: chain {n.get('chain')!r} is gone; the size picks the workflow (plan.workflow), "
+                          f"and `escalate` moves a task up one size. Only `chain: none` remains.")
+        if n.get("escalate") is not None and n.get("escalate") not in ESCALATIONS:
+            errors.append(f"{nid}: escalate must be one of {ESCALATIONS}; a task that fits none runs its size's workflow")
         if n.get("size") not in SIZES:
             errors.append(f"{nid}: size must be one of {SIZES}")
         if n.get("status") not in STATUSES:
@@ -415,6 +533,8 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
                     errors.append(f"{nid}: each owner_decisions item needs `question` and `default`")
         if n.get("kind") == "code" and not n.get("files"):
             warnings.append(f"{nid}: a code task with no `files` cannot be excluded from a conflicting lane")
+        if isinstance(plan, dict) and n.get("size") in SIZES:
+            used_stages |= set(workflow_of(n, plan))
         if "spec" in n:
             doc, anchor = spec_target(n, data, graph_path)
             key = (str(doc.resolve()), anchor)
@@ -428,6 +548,10 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
                     section(doc, anchor)
                 except AnchorError as exc:
                     errors.append(f"{nid}: {exc} in {doc.name}")
+    models = plan.get("models") or {}
+    for stage in sorted(used_stages & set(STAGES), key=STAGES.index):
+        if not models.get(stage):
+            errors.append(f"plan.models.{stage} is missing; the user picks a model for every stage the workflows use")
     if not errors and (cycle := find_cycle(data)):
         errors.append("dependency cycle: " + " -> ".join(cycle))
     return errors, warnings
@@ -458,6 +582,95 @@ def find_cycle(data: dict) -> list[str] | None:
     return None
 
 
+# ── timings ────────────────────────────────────────────────────────────────────
+
+STAGE_LOG_RE = re.compile(r"^(\S+) stage=(\S+) start model=(\S*) effort=(\S*) applied=(\S*)$")
+
+
+def stage_runs(node: dict, scratch: Path) -> list[dict]:
+    """Each prompt started for the node (the last start per prompt), with its end from the report's mtime."""
+    runs: dict[str, dict] = {}
+    for line in node.get("log") or []:
+        m = STAGE_LOG_RE.match(str(line))
+        if m:
+            runs[m.group(2)] = {"name": m.group(2), "start": datetime.fromisoformat(m.group(1)),
+                                "model": m.group(3), "effort": m.group(4), "applied": m.group(5)}
+    for run in runs.values():
+        report = report_file(scratch, node["id"], run["name"])
+        end = datetime.fromtimestamp(report.stat().st_mtime) if report.exists() else None
+        run["end"] = end if end and end >= run["start"] else None
+        run["minutes"] = round((run["end"] - run["start"]).total_seconds() / 60, 2) if run["end"] else None
+    return list(runs.values())
+
+
+def load_timings(graph_path: Path, plan: dict) -> list[dict]:
+    path = timings_file(graph_path, plan)
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def record_timings(data: dict, graph_path: Path, nid: str) -> int:
+    """Append the node's measured stage durations to the repository's timings file; return how many."""
+    plan = data["plan"]
+    node = by_id(data)[nid]
+    scratch = lane_scratch(plan, graph_path, nid)
+    by_stage: dict[str, dict] = {}
+    for run in stage_runs(node, scratch):
+        if run["minutes"] is None:
+            continue
+        stage = run["name"].rsplit("-", 1)[0] if run["name"].endswith(("-report", "-fix")) else run["name"]
+        rec = by_stage.setdefault(stage, {"stage": stage, "size": effective_size(node), "model": run["model"],
+                                          "effort": run["effort"], "applied": run["applied"], "minutes": 0.0,
+                                          "task": nid, "plan": str(plan.get("title", "")),
+                                          "start": run["start"].isoformat()})
+        rec["minutes"] = round(rec["minutes"] + run["minutes"], 2)
+    path = timings_file(graph_path, plan)
+    seen = {(r.get("plan"), r.get("task"), r.get("stage"), r.get("start")) for r in load_timings(graph_path, plan)}
+    new = [r for r in by_stage.values() if (r["plan"], r["task"], r["stage"], r["start"]) not in seen]
+    if new:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            for r in new:
+                fh.write(json.dumps(r) + "\n")
+    return len(new)
+
+
+def stage_estimate(plan: dict, records: list[dict], stage: str, size: str) -> tuple[float, bool]:
+    """(minutes, measured?) for one stage: measured medians first, then the model-neutral defaults."""
+    model, effort = model_for(plan, stage), effort_for(plan, stage)
+    for match in (lambda r: (r.get("size"), r.get("model"), r.get("effort")) == (size, model, effort),
+                  lambda r: (r.get("size"), r.get("model")) == (size, model)):
+        xs = [float(r["minutes"]) for r in records if r.get("stage") == stage and match(r)]
+        if xs:
+            return statistics.median(xs), True
+    xs = [float(r["minutes"]) / SIZE_FACTOR.get(r.get("size"), 1) for r in records
+          if r.get("stage") == stage and r.get("model") == model]
+    if xs:
+        return statistics.median(xs) * SIZE_FACTOR.get(size, 1), True
+    base = {**STAGE_MINUTES, **{k: float(v) for k, v in (plan.get("stage_minutes") or {}).items()}}
+    return base.get(stage, 3.0) * SIZE_FACTOR.get(size, 1), False
+
+
+def task_minutes(node: dict, plan: dict, records: list[dict]) -> tuple[float, int, int]:
+    """(minutes, measured stages, estimated stages) for the node's workflow, without a conditional fix."""
+    total, measured, estimated = 0.0, 0, 0
+    for stage in workflow_of(node, plan):
+        if stage == "fix":
+            continue
+        minutes, from_data = stage_estimate(plan, records, stage, effective_size(node))
+        total += minutes
+        measured += from_data
+        estimated += not from_data
+    return total, measured, estimated
+
+
 # ── scheduling ─────────────────────────────────────────────────────────────────
 
 def waves(data: dict) -> list[list[str]]:
@@ -473,28 +686,12 @@ def waves(data: dict) -> list[list[str]]:
     return out
 
 
-def critical_path(data: dict) -> tuple[list[str], float, float]:
-    """(the longest chain of unfinished tasks by hard deps, its minutes, the minutes of all tasks)."""
-    plan = data["plan"]
-    nodes = {i: n for i, n in by_id(data).items() if n.get("status") not in FINISHED_STATUSES}
-    best: dict[str, tuple[float, list[str]]] = {}
+def next_ready(data: dict, changed: dict[str, set[str]] | None = None) -> tuple[list[dict], list[tuple[str, str]], int]:
+    """(tasks to start now, [(held task, reason)], free slots).
 
-    def longest(i: str) -> tuple[float, list[str]]:
-        if i not in best:
-            before = [longest(d) for d in nodes[i].get("deps") or [] if d in nodes]
-            t, path = max(before, default=(0.0, []), key=lambda x: x[0])
-            best[i] = (t + task_minutes(nodes[i], plan), path + [i])
-        return best[i]
-
-    if find_cycle(data):
-        return [], 0.0, 0.0
-    runs = [longest(i) for i in nodes]
-    t, path = max(runs, default=(0.0, []), key=lambda x: x[0])
-    return path, t, sum(task_minutes(n, plan) for n in nodes.values())
-
-
-def next_ready(data: dict) -> tuple[list[dict], list[tuple[str, str]], int]:
-    """(tasks to start now, [(held task, reason)], free slots)."""
+    `changed` maps an open lane to the files it has actually changed, which
+    exclude other tasks as its listed `files` do.
+    """
     plan = data["plan"]
     nodes = by_id(data)
     done = {i for i, n in nodes.items() if n.get("status") in FINISHED_STATUSES}
@@ -537,6 +734,8 @@ def next_ready(data: dict) -> tuple[list[dict], list[tuple[str, str]], int]:
 
     start: list[dict] = []
     taken = {f for n in running for f in (n.get("files") or [])}
+    for files in (changed or {}).values():
+        taken |= files
     for n in eligible:
         shared = sorted(set(n.get("files") or []) & taken)
         if shared:
@@ -554,6 +753,37 @@ def next_ready(data: dict) -> tuple[list[dict], list[tuple[str, str]], int]:
         start.append(n)
         taken |= set(n.get("files") or [])
     return start, hold, slots
+
+
+def simulate(data: dict, records: list[dict]) -> tuple[float, int, float]:
+    """(minutes to finish every unfinished task, most lanes open at once, minutes back to back).
+
+    Runs the real scheduler (dependencies, file exclusions, `alone`, the lane
+    cap) against estimated task durations. Open lanes restart from zero, and
+    owner questions count as answered.
+    """
+    plan = data["plan"]
+    nodes = {i: dict(n) for i, n in by_id(data).items()}
+    for n in nodes.values():
+        if n.get("status") in OPEN_STATUSES:
+            n["status"] = "planned"
+        n["owner_decisions"] = []
+    sim = {"plan": {**plan, "autonomy": 4}, "nodes": list(nodes.values())}
+    minutes = {i: task_minutes(n, plan, records)[0] for i, n in nodes.items()}
+    clock, running, peak = 0.0, {}, 0
+    while True:
+        start, _, _ = next_ready(sim)
+        for n in start:
+            n["status"] = "running"
+            running[n["id"]] = clock + minutes[n["id"]]
+        peak = max(peak, len(running))
+        if not running:
+            break
+        first = min(running, key=running.get)
+        clock = running.pop(first)
+        nodes[first]["status"] = "done"
+    total = sum(m for i, m in minutes.items() if by_id(data)[i].get("status") not in FINISHED_STATUSES)
+    return clock, peak, total
 
 
 # ── mutation of the graph file ─────────────────────────────────────────────────
@@ -585,29 +815,33 @@ def set_fields(data: dict, nid: str, assignments: list[str]) -> None:
         else:
             raise SystemExit(f"unknown key {key!r}; use status, lane, branch, commit, answer, log")
         changed.append(a)
-    if "log" not in n or n["log"] is None:
-        n["log"] = []
-    n["log"].append(f"{datetime.now().isoformat(timespec='minutes')} {' '.join(changed)}")
+    append_log(n, " ".join(changed))
+
+
+def append_log(node: dict, text: str) -> None:
+    if "log" not in node or node["log"] is None:
+        node["log"] = []
+    node["log"].append(f"{now()} {text}")
 
 
 # ── rendering ──────────────────────────────────────────────────────────────────
 
 def render(data: dict) -> str:
-    rows = ["| id | title | kind | size | status | deps | lane | commit |", "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+    plan = data["plan"]
+    rows = ["| id | title | kind | size | workflow | status | deps | commit |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |"]
     for n in data["nodes"]:
-        rows.append("| {id} | {title} | {kind} | {size} | {status} | {deps} | {lane} | {commit} |".format(
+        rows.append("| {id} | {title} | {kind} | {size} | {wf} | {status} | {deps} | {commit} |".format(
             id=n.get("id"), title=n.get("title", ""), kind=n.get("kind", ""), size=n.get("size", ""),
-            status=n.get("status", ""), deps=", ".join(n.get("deps") or []) or "-",
-            lane=n.get("lane") or "-", commit=n.get("commit") or "-"))
-    counts: dict[str, int] = {}
-    for n in data["nodes"]:
-        counts[n.get("status", "?")] = counts.get(n.get("status", "?"), 0) + 1
+            wf=" → ".join(workflow_of(n, plan)) or "none", status=n.get("status", ""),
+            deps=", ".join(n.get("deps") or []) or "-", commit=n.get("commit") or "-"))
+    counts = Counter(n.get("status", "?") for n in data["nodes"])
     rows.append("")
     rows.append("Totals: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
     return "\n".join(rows)
 
 
-# ── lane commands ──────────────────────────────────────────────────────────────
+# ── git and lane commands ──────────────────────────────────────────────────────
 
 def _git(*args: str) -> str | None:
     """Run a read-only git command; return its stdout, or None if it failed."""
@@ -631,6 +865,23 @@ def rebase_in_progress(wt: Path) -> bool:
     return False
 
 
+def lane_changes(data: dict, graph_path: Path) -> dict[str, set[str]]:
+    """The files each open lane has changed so far, committed or not."""
+    plan = data["plan"]
+    root, main = repo_root(graph_path), str(plan.get("integration_branch", "main"))
+    out: dict[str, set[str]] = {}
+    for n in by_id(data).values():
+        if n.get("status") not in OPEN_STATUSES or not n.get("branch"):
+            continue
+        files = set((_git("-C", str(root), "diff", "--name-only", f"{main}...{n['branch']}") or "").splitlines())
+        wt = Path(str(n.get("lane") or ""))
+        if wt.is_dir():
+            for line in (_git("-C", str(wt), "status", "--porcelain") or "").splitlines():
+                files.add(line[3:].split(" -> ")[-1])
+        out[n["id"]] = {f for f in files if f}
+    return out
+
+
 def landed_commit(root: Path, nid: str, branch: str, main: str, policy: str) -> str | None:
     """The integration commit if an earlier integration already merged the lane."""
     if policy == "squash":
@@ -644,8 +895,10 @@ def landed_commit(root: Path, nid: str, branch: str, main: str, policy: str) -> 
     return None
 
 
-def check_integrable(root: Path, wt: Path, branch: str, main: str) -> None:
-    """Refuse to print integration steps for a lane that would land nothing or the wrong thing."""
+def check_integrable(data: dict, graph_path: Path, nid: str, root: Path, wt: Path, branch: str, main: str) -> None:
+    """Refuse to print integration steps for a lane that would land nothing, the wrong thing, or unreviewed work."""
+    plan = data["plan"]
+    node = by_id(data)[nid]
     if not wt.is_dir():
         raise SystemExit(f"refused: the lane worktree {wt} does not exist")
     if rebase_in_progress(wt):
@@ -660,9 +913,23 @@ def check_integrable(root: Path, wt: Path, branch: str, main: str) -> None:
         raise SystemExit(f"refused: git status failed in {wt}")
     if dirty:
         raise SystemExit(
-            f"refused: the lane has uncommitted changes. Every chain stage ends with a commit "
-            f"(see references/chain.md); commit or discard these first. If they are build output, "
-            f"add their pattern to .git/info/exclude:\n{dirty}")
+            f"refused: the lane has uncommitted changes. Every stage ends with a commit; commit or discard "
+            f"these first. If they are build output, add their pattern to .git/info/exclude:\n{dirty}")
+    proofs = _git("-C", str(wt), "grep", "-l", "review_proof_")
+    if proofs:
+        raise SystemExit(f"refused: review_proof_ tests remain; the review's fix part turns each into a real test "
+                         f"or removes it:\n{proofs}")
+    scratch = lane_scratch(plan, graph_path, nid)
+    started = {r["name"] for r in stage_runs(node, scratch)}
+    required = [name for stage in workflow_of(node, plan) if stage != "fix" for name in part_names(stage)]
+    if "fix" in started:
+        required.append("fix")
+        if int(plan.get("autonomy", 2)) < 4 and not (scratch / f"{nid}_decisions.md").exists():
+            raise SystemExit(f"refused: the fix stage ran without {scratch / f'{nid}_decisions.md'}")
+    missing = [str(report_file(scratch, nid, name)) for name in required if not report_file(scratch, nid, name).exists()]
+    if missing:
+        raise SystemExit("refused: the workflow isn't finished; these reports are missing (run the stage):\n"
+                         + "\n".join(missing))
     ahead = _git("-C", str(root), "rev-list", "--count", f"{main}..{branch}")
     if ahead is None:
         raise SystemExit(f"refused: cannot compare {branch} with {main}")
@@ -684,74 +951,89 @@ def lane_commands(data: dict, graph_path: Path, nid: str, action: str) -> str:
         raise SystemExit(f"unknown node id: {nid}")
     root = repo_root(graph_path)
     wt = root_dir(plan, "worktree_root", graph_path) / nid
-    scratch = root_dir(plan, "scratch_root", graph_path) / nid
+    scratch = lane_scratch(plan, graph_path, nid)
     branch = f"{plan['branch_prefix']}{nid}"
     main = str(plan["integration_branch"])
     policy = str(plan.get("commit_policy"))
     q = shlex.quote
     me = f"uv run {q(str(SELF))}"
     graph = q(str(graph_path))
+    doc = spec_target(n, data, graph_path)[0]
     lines: list[str] = [f"# lane {nid}: {action}. Run the command below as one command; it stops at the first failure."]
+
+    def merge_steps() -> list[str]:
+        steps = [f"git -C {q(str(wt))} rebase {q(main)}"]
+        steps += [f"(cd {q(str(wt))} && {gate})" for gate in plan.get("gates") or []]
+        if policy == "squash":
+            steps += [f"git -C {q(str(root))} merge --squash {q(branch)}",
+                      f"git -C {q(str(root))} commit -m {q(f'{nid}: {n.get('title', '')}')} -m {q(f'Plan-Task: {nid}')}"]
+        else:
+            steps += [f"git -C {q(str(root))} merge --ff-only {q(branch)}"]
+        return steps + [f"{me} set {graph} {q(nid)} status=done commit=$(git -C {q(str(root))} rev-parse --short HEAD)"]
+
+    def close_steps() -> list[str]:
+        # Tracked changes after integration (a formatter run by a gate) stop the removal;
+        # untracked gate output doesn't, since `integrate` refused untracked files before the merge.
+        steps = [f'test -z "$(git -C {q(str(wt))} status --porcelain --untracked-files=no)"',
+                 f"git -C {q(str(root))} worktree remove --force {q(str(wt))}"] if wt.is_dir() else []
+        # A squash merge does not mark the branch merged, so -d would refuse it.
+        steps.append(f"git -C {q(str(root))} branch {'-D' if policy == 'squash' else '-d'} {q(branch)}")
+        return steps + [f"{me} set {graph} {q(nid)} lane= branch=", f"{me} clean {graph} {q(nid)}"]
+
+    def record_steps() -> list[str]:
+        paths = " ".join(q(str(p)) for p in (doc, graph_path))
+        return [f"{me} landed {graph} {q(nid)}",
+                f"git -C {q(str(root))} add -- {paths}",
+                f"git -C {q(str(root))} commit -q -m \"plan: {nid} landed ($(git -C {q(str(root))} rev-parse --short HEAD))\" -- {paths}"]
+
     if action == "open":
         if n.get("status") != "planned":
             raise SystemExit(f"refused: {nid} is {n.get('status')}, not planned")
-        return "\n".join(_chain(lines, [
-            f"git -C {q(str(root))} worktree add {q(str(wt))} -b {q(branch)} {q(main)}",
-            f"mkdir -p {q(str(scratch))}",
-            f"{me} set {graph} {q(nid)} status=running lane={q(str(wt))} branch={q(branch)}",
-        ]))
-    if action == "integrate":
+        steps = [f"git -C {q(str(root))} worktree add {q(str(wt))} -b {q(branch)} {q(main)}",
+                 f"mkdir -p {q(str(scratch))}",
+                 f"{me} set {graph} {q(nid)} status=running lane={q(str(wt))} branch={q(branch)}"]
+        if "delegate" in workflow_of(n, plan):
+            steps.append(f"{me} context {graph} {q(nid)}")
+        steps.append(f"{me} prompt {graph} {q(nid)} implement")
+        return "\n".join(_chain(lines, steps))
+    if action in ("integrate", "land"):
         landed = landed_commit(root, nid, branch, main, policy)
         if landed:
             lines += [f"# {branch} already landed on {main} at {landed}: an earlier integration stopped after the merge."]
-            return "\n".join(_chain(lines, [f"{me} set {graph} {q(nid)} status=done commit={landed}"]))
-        check_integrable(root, wt, branch, main)
+            steps = [f"{me} set {graph} {q(nid)} status=done commit={landed}"]
+            if action == "land":
+                steps += close_steps() + record_steps()
+            return "\n".join(_chain(lines, steps))
+        check_integrable(data, graph_path, nid, root, wt, branch, main)
         changed = (_git("-C", str(root), "diff", "--name-only", f"{main}...{branch}") or "").splitlines()
         unlisted = sorted(set(changed) - set(n.get("files") or []))
         if unlisted:
             lines += [f"# note: the lane changed files that `files` does not list: {', '.join(unlisted)}",
                       "# add them to the task's `files` so the exclusion rule holds for the tasks still to run"]
-        steps = [f"git -C {q(str(wt))} rebase {q(main)}"]
-        steps += [f"(cd {q(str(wt))} && {gate})" for gate in plan.get("gates") or []]
-        if policy == "squash":
-            steps += [
-                f"git -C {q(str(root))} merge --squash {q(branch)}",
-                f"git -C {q(str(root))} commit -m {q(f'{nid}: {n.get('title', '')}')} -m {q(f'Plan-Task: {nid}')}",
-            ]
-        else:
-            steps += [f"git -C {q(str(root))} merge --ff-only {q(branch)}"]
-        steps += [f"{me} set {graph} {q(nid)} status=done commit=$(git -C {q(str(root))} rev-parse --short HEAD)"]
+        steps = merge_steps()
+        if action == "land":
+            steps += close_steps() + record_steps()
         lines = _chain(lines, steps)
-        lines += ["# then: close the lane, apply the as-landed text, and commit the plan document and graph.yaml"]
+        if action == "integrate":
+            lines += ["# then: close the lane, apply the as-landed text, and commit the plan document and graph.yaml"]
         return "\n".join(lines)
     if action == "close":
         if n.get("status") not in FINISHED_STATUSES:
             raise SystemExit(f"refused: {nid} is {n.get('status')}, not done; use `abandon` to give up on a lane")
-        steps = []
         if wt.is_dir():
-            # `integrate` refused untracked files before the merge, so anything
-            # untracked now is output of the gates run at integration (a cache,
-            # a build directory the repository doesn't ignore). Tracked changes
-            # are not, and stop the close.
             tracked = _git("-C", str(wt), "status", "--porcelain", "--untracked-files=no")
             if tracked:
                 raise SystemExit(f"refused: tracked files changed in {wt} after integration:\n{tracked}")
-            force = "--force " if _git("-C", str(wt), "status", "--porcelain") else ""
-            steps.append(f"git -C {q(str(root))} worktree remove {force}{q(str(wt))}")
-        if _git("-C", str(root), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"):
-            # A squash merge does not mark the branch merged, so -d would refuse it.
-            steps.append(f"git -C {q(str(root))} branch {'-D' if policy == 'squash' else '-d'} {q(branch)}")
-        steps.append(f"{me} set {graph} {q(nid)} lane= branch=")
-        lines = _chain(lines, steps)
-        lines += ["# then clean the lane's build directory if it lives outside the worktree (project-specific)"]
-        return "\n".join(lines)
+        steps = close_steps()
+        if not _git("-C", str(root), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"):
+            steps = [s for s in steps if " branch -" not in s]
+        return "\n".join(_chain(lines, steps))
     if action == "abandon":
         if not wt.is_dir():
             raise SystemExit(f"refused: the lane worktree {wt} does not exist")
         patch = scratch / f"{nid}.abandoned.patch"
         keep = f"abandoned/{nid}"
-        lines += ["# saves the lane's work as a patch, removes the worktree, and keeps every commit on the branch "
-                  f"{keep}"]
+        lines += [f"# saves the lane's work as a patch, removes the worktree, and keeps every commit on {keep}"]
         steps = [f"mkdir -p {q(str(scratch))}"]
         if rebase_in_progress(wt):
             steps.append(f"git -C {q(str(wt))} rebase --abort")
@@ -761,6 +1043,7 @@ def lane_commands(data: dict, graph_path: Path, nid: str, action: str) -> str:
             f"git -C {q(str(root))} worktree remove --force {q(str(wt))}",
             f"git -C {q(str(root))} branch -m {q(branch)} {q(keep)}",
             f"{me} set {graph} {q(nid)} status=blocked lane= branch={q(keep)} log=abandoned:{q(str(patch))}",
+            f"{me} clean {graph} {q(nid)}",
         ]
         return "\n".join(_chain(lines, steps))
     if action == "discard":
@@ -779,116 +1062,65 @@ def lane_commands(data: dict, graph_path: Path, nid: str, action: str) -> str:
             f"git -C {q(str(wt))} clean -fdq",
         ]
         return "\n".join(_chain(lines, steps))
-    raise SystemExit("action must be open, integrate, close, abandon, or discard")
+    raise SystemExit("action must be open, integrate, close, land, abandon, or discard")
 
 
-# ── stage prompts ──────────────────────────────────────────────────────────────
+# ── report sections ────────────────────────────────────────────────────────────
 
-TEMPLATE_RE = re.compile(r"^```template:([\w-]+)\n(.*?)^```", re.M | re.S)
-
-
-def templates() -> dict[str, str]:
-    found = dict(TEMPLATE_RE.findall(CHAIN_DOC.read_text(encoding="utf-8")))
-    missing = {"header", "implement", "implement-measurement", "review", "fix", "final-review",
-               "final-review-light"} - set(found)
-    if missing:
-        raise SystemExit(f"{CHAIN_DOC} lacks the templates: {', '.join(sorted(missing))}")
-    return found
+def _heading_re(title: str) -> re.Pattern:
+    return re.compile(rf"^\s*(?:(#{{1,6}})\s*|\*\*)?(?:\(?\d\)?\.?\s*)?{re.escape(title)}\b[.:*\s]*$", re.I)
 
 
-def _owner_decisions(node: dict, autonomy: int) -> str:
-    items = []
-    for od in node.get("owner_decisions") or []:
-        answer = str(od.get("answer") or "").strip()
-        if answer:
-            items.append(f"{od['question']} -> {answer}")
-        elif autonomy >= 4:
-            items.append(f"{od['question']} -> {od['default']} (taken by default)")
-        else:
-            raise SystemExit(f"refused: the owner hasn't answered: {od['question']}")
-    return "; ".join(items) or "none"
-
-
-def render_prompt(data: dict, graph_path: Path, nid: str, stage: str, decisions: Path | None) -> tuple[Path, str]:
-    """Fill the stage's template; return (prompt file, launcher line)."""
-    plan = data["plan"]
-    n = by_id(data).get(nid)
-    if n is None:
-        raise SystemExit(f"unknown node id: {nid}")
-    chain = chain_of(n)
-    if stage == "fix" and decisions is None:
-        raise SystemExit("refused: the fix stage needs --decisions FILE (one decision per finding, or the gate failure)")
-    # A reopened lane runs the fix stage whatever its chain.
-    if stage not in CHAIN_STAGES.get(chain, ()) and stage != "fix":
-        raise SystemExit(f"refused: {nid} runs the `{chain}` chain, which has no {stage} stage")
-    name = {
-        "implement": "implement-measurement" if chain == "measurement" else "implement",
-        "review": "review",
-        "fix": "fix",
-        "final-review": "final-review" if chain == "default" else "final-review-light",
-    }[stage]
-    doc, anchor = spec_target(n, data, graph_path)
-    try:
-        spec = section(doc, anchor)
-    except AnchorError as exc:
-        raise SystemExit(f"{nid}: {exc} in {doc}")
-    scratch = root_dir(plan, "scratch_root", graph_path) / nid
-    commands = plan.get("commands") or {}
-    values = {
-        "task_id": nid,
-        "task_title": str(n.get("title", "")),
-        "lane_worktree": str(n.get("lane") or root_dir(plan, "worktree_root", graph_path) / nid),
-        "lane_branch": str(n.get("branch") or f"{plan['branch_prefix']}{nid}"),
-        "integration_branch": str(plan["integration_branch"]),
-        "scratch": str(scratch),
-        "stage": str(STAGE_NUMBER[stage]),
-        "guidelines": ", ".join(str(resolve_doc(str(g), graph_path)) for g in plan.get("guidelines") or []) or "none",
-        "prior_plans": ", ".join(str(resolve_doc(str(g), graph_path)) for g in plan.get("prior_plans") or []) or "none",
-        "commands": "; ".join(f"{k}: `{v}`" for k, v in commands.items()) or "see the gates",
-        "gates": ", then ".join(f"`{g}`" for g in plan.get("gates") or []),
-        "files": ", ".join(str(f) for f in n.get("files") or []) or "none listed",
-        "owner_decisions": _owner_decisions(n, int(plan.get("autonomy", 2))),
-        "spec": spec,
-        "decisions": decisions.read_text(encoding="utf-8").strip() if decisions else "",
-    }
-    tpl = templates()
-    text = tpl[name].replace("{{common header}}", tpl["header"].rstrip("\n"))
-    for key, value in values.items():
-        text = text.replace("{{" + key + "}}", value)
-    left = sorted(set(re.findall(r"\{\{[\w ]+\}\}", text)))
-    if left:
-        raise SystemExit(f"template {name} has unknown placeholders: {', '.join(left)}")
-    scratch.mkdir(parents=True, exist_ok=True)
-    out = scratch / f"{nid}_prompt_{STAGE_NUMBER[stage]}.md"
-    out.write_text(text, encoding="utf-8")
-    launcher = (f"You are stage {STAGE_NUMBER[stage]} ({stage}) of task {nid}. Your complete instructions are "
-                f"in {out}. Read that file first and follow it exactly; it is your whole task.")
-    return out, launcher
-
-
-# ── as-landed text ─────────────────────────────────────────────────────────────
-
-AS_LANDED_RE = re.compile(r"^\s*(?:(#{1,6})\s*|\*\*)?(?:\(?\d\)?\.?\s*)?As landed\b[.:*\s]*$", re.I)
-
-
-def as_landed_text(report: Path) -> str:
-    """The text under a report's "As landed" heading, up to the next heading of the same or a higher level."""
+def report_section(report: Path, title: str) -> str | None:
+    """The text under a report's heading `title`, up to the next heading of the same or a higher level."""
+    if not report.exists():
+        return None
     lines = report.read_text(encoding="utf-8").splitlines()
+    pattern = _heading_re(title)
     for i, line in enumerate(lines):
-        m = AS_LANDED_RE.match(line)
+        m = pattern.match(line)
         if not m:
             continue
         level = len(m.group(1)) if m.group(1) else 7
         body = []
         for nxt in lines[i + 1:]:
             h = HEADING_RE.match(nxt)
-            if h and len(h.group(1)) <= level:
+            if (h and len(h.group(1)) <= level) or (level == 7 and re.match(r"^\s*\*\*[^*]+\*\*\s*$", nxt)):
                 break
             body.append(nxt)
         text = "\n".join(body).strip()
-        if text:
+        if text and text.lower() not in ("none", "none.", "- none", "n/a"):
             return text
-    raise SystemExit(f"no \"As landed\" heading with text in {report}")
+    return None
+
+
+def as_landed_text(report: Path) -> str:
+    text = report_section(report, "As landed")
+    if not text:
+        raise SystemExit(f"no \"As landed\" heading with text in {report}")
+    return text
+
+
+def task_reports(node: dict, plan: dict, scratch: Path) -> list[Path]:
+    names = [name for stage in workflow_of(node, plan) for name in part_names(stage)]
+    if "fix" not in names:
+        names.append("fix")
+    ordered = [n for n in ("implement", "review-report", "review-fix", "second_review-report",
+                           "second_review-fix", "fix", "delegate") if n in names]
+    return [report_file(scratch, node["id"], n) for n in ordered]
+
+
+FINDING_SECTIONS = ("Needs owner", "Owner-level decisions taken", "Beyond", "Residuals")
+
+
+def findings(node: dict, plan: dict, scratch: Path) -> dict[str, list[tuple[str, str]]]:
+    out: dict[str, list[tuple[str, str]]] = {s: [] for s in FINDING_SECTIONS}
+    for report in task_reports(node, plan, scratch):
+        for title in FINDING_SECTIONS:
+            text = report_section(report, title)
+            if text:
+                out[title].append((report.name, text))
+    return out
 
 
 def apply_landed(doc: Path, anchor: str, text: str) -> None:
@@ -911,10 +1143,289 @@ def apply_landed(doc: Path, anchor: str, text: str) -> None:
         new = ["**As landed.**", "", *text.splitlines(), ""]
         body = (body[:at] if at is not None else body + [""]) + new
         result = "\n".join(lines[:start] + body + lines[end:]) + ("\n" if source.endswith("\n") else "")
-    fd, tmp = tempfile.mkstemp(dir=doc.parent, prefix=f".{doc.name}.")
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(result)
-    os.replace(tmp, doc)
+    _write_atomic(doc, result)
+
+
+def landed_in_section(text: str) -> str:
+    """The "As landed" text of a task section, as `section()` returns it."""
+    m = re.search(r"(?is)\**As landed\.?\**\s*(.*)$", text)
+    body = m.group(1).strip() if m else ""
+    return "" if body.lower().startswith("empty until") else body
+
+
+# ── coordinator brief ──────────────────────────────────────────────────────────
+
+AUTONOMY_MEANING = {
+    0: "the owner confirms every lane and integration, and answers every owner question",
+    1: "the owner answers owner questions and rules on P1 and P2 findings",
+    2: "the owner answers owner questions and rules on P1 findings",
+    3: "the owner answers owner questions",
+    4: "nobody answers: owner-level calls are made by the workflow and reported in full",
+}
+SCOPE_RULES = """- `spec`: the work violates the specification or an acceptance criterion. Fix it.
+- `defect`: a wrong result, a crash, or data loss in a case the specification doesn't address. Fix it when the fix is small.
+- `quality` (second review): simpler, clearer, or a better fit with the existing code and the upcoming tasks, with no change in behavior. Fix it.
+- `beyond`: a behavior change the specification doesn't ask for. Report it; it is applied only when accepted.
+- Removing or changing existing behavior the specification doesn't mention is an owner decision."""
+
+
+def build_context(data: dict, graph_path: Path, nid: str, note: str | None) -> Path:
+    plan = data["plan"]
+    nodes = by_id(data)
+    node = nodes[nid]
+    autonomy = int(plan.get("autonomy", 2))
+    parts = [f"# Coordinator's brief for task {nid}", "",
+             f"Plan: {plan.get('title', '')}. Autonomy {autonomy}: {AUTONOMY_MEANING.get(autonomy, '')}. "
+             f"Coordinator mode: {plan.get('coordinator', 'full')}.", "",
+             "## This task", "", f"{nid}: {node.get('title', '')}. Expected files: "
+             + (", ".join(str(f) for f in node.get("files") or []) or "none listed") + ".", ""]
+    ods = node.get("owner_decisions") or []
+    for od in ods:
+        answer = str(od.get("answer") or "").strip()
+        parts.append(f"- Owner question: {od['question']} Answer: {answer or od['default'] + ' (default)'}")
+    parts += ["", "## Scope rules", "", SCOPE_RULES, "", "## Tasks already landed", ""]
+    landed = []
+    for other in nodes.values():
+        if other["id"] == nid or other.get("status") != "done":
+            continue
+        doc, anchor = spec_target(other, data, graph_path)
+        try:
+            text = landed_in_section(section(doc, anchor))
+        except (AnchorError, OSError):
+            text = ""
+        landed.append(f"- {other['id']} ({other.get('commit') or '-'}): {other.get('title', '')}. "
+                      f"As landed: {text or 'not recorded'}")
+    parts += landed or ["- none"]
+    parts += ["", "## Tasks still to come", ""]
+    upcoming = [f"- {o['id']}: {o.get('title', '')}; expected files: " + (", ".join(str(f) for f in o.get("files") or []) or "none")
+                for o in nodes.values() if o["id"] != nid and o.get("status") not in FINISHED_STATUSES + ("blocked",)]
+    parts += upcoming or ["- none"]
+    doc = graph_path.parent / str(plan.get("spec", ""))
+    try:
+        residuals = section(doc, "residuals")
+        residuals = "\n".join(residuals.splitlines()[1:]).strip()
+    except (AnchorError, OSError):
+        residuals = ""
+    parts += ["", "## Open residuals", "", residuals or "none", "", "## The coordinator's note", "", note or "none", ""]
+    scratch = lane_scratch(plan, graph_path, nid)
+    scratch.mkdir(parents=True, exist_ok=True)
+    out = scratch / f"{nid}_context.md"
+    out.write_text("\n".join(parts), encoding="utf-8")
+    return out
+
+
+# ── stage prompts ──────────────────────────────────────────────────────────────
+
+TEMPLATE_RE = re.compile(r"^```template:([\w-]+)\n(.*?)^```", re.M | re.S)
+TEMPLATE_NAMES = {"header", "implement", "implement-measurement", "review-report", "review-fix",
+                  "second_review-report", "second_review-fix", "fix", "delegate"}
+
+
+def templates() -> dict[str, str]:
+    found = dict(TEMPLATE_RE.findall(TEMPLATES.read_text(encoding="utf-8")))
+    missing = TEMPLATE_NAMES - set(found)
+    if missing:
+        raise SystemExit(f"{TEMPLATES} lacks the templates: {', '.join(sorted(missing))}")
+    return found
+
+
+def _owner_decisions(node: dict, autonomy: int) -> str:
+    items = []
+    for od in node.get("owner_decisions") or []:
+        answer = str(od.get("answer") or "").strip()
+        if answer:
+            items.append(f"{od['question']} -> {answer}")
+        elif autonomy >= 4:
+            items.append(f"{od['question']} -> {od['default']} (taken by default)")
+        else:
+            raise SystemExit(f"refused: the owner hasn't answered: {od['question']}")
+    return "; ".join(items) or "none"
+
+
+def render_prompt(data: dict, graph_path: Path, nid: str, stage: str, part: str | None = None,
+                  decisions: Path | None = None, via: str = "agent") -> tuple[Path, str]:
+    """Fill the stage's template, log the stage's start; return (prompt file, launcher line)."""
+    plan = data["plan"]
+    n = by_id(data).get(nid)
+    if n is None:
+        raise SystemExit(f"unknown node id: {nid}")
+    stages = workflow_of(n, plan)
+    autonomy = int(plan.get("autonomy", 2))
+    if stage not in TWO_PART and part:
+        raise SystemExit(f"refused: the {stage} stage has no parts")
+    if stage == "fix":
+        # The fix stage also runs outside the workflow, to apply the owner's answers or reopen a lane.
+        if decisions is None and not (autonomy >= 4 and decider(plan, stages) == "fix"):
+            raise SystemExit("refused: the fix stage needs --decisions FILE (accepted findings, owner answers, "
+                             "or the gate failure)")
+    elif stage not in stages:
+        raise SystemExit(f"refused: {nid}'s workflow is {' -> '.join(stages) or 'none'}; it has no {stage} stage")
+    name = prompt_name(stage, part)
+    tpl_name = "implement-measurement" if stage == "implement" and n.get("kind") == "measurement" else name
+    doc, anchor = spec_target(n, data, graph_path)
+    try:
+        spec = section(doc, anchor)
+    except AnchorError as exc:
+        raise SystemExit(f"{nid}: {exc} in {doc}")
+    scratch = lane_scratch(plan, graph_path, nid)
+    tmp = stage_tmp(scratch, name)
+    tmp.mkdir(parents=True, exist_ok=True)
+    context = scratch / f"{nid}_context.md"
+    if stage in ("second_review", "delegate") and not context.exists():
+        context = build_context(data, graph_path, nid, None)
+    is_last_review = stage == last_review(stages)
+    writes_landed = (name in ("fix", "delegate") or (part == "fix" and is_last_review)
+                     or (stage == "implement" and n.get("kind") == "measurement"))
+    decides = autonomy >= 4 and decider(plan, stages) == stage and (stage not in TWO_PART or part == "fix")
+    if stage == "review":
+        mutation = ("Don't re-run stage 1's mutations; the second reviewer does that."
+                    if "second_review" in stages else
+                    "Re-run each mutation the implementer's report lists, and confirm a test still catches it.")
+    elif stage == "second_review":
+        mutation = "Re-run each mutation the implementer's report lists, and confirm a test still catches it after the first review's fixes."
+    else:
+        mutation = ""
+    owner_rule = (
+        "Owner-level calls are yours, because nobody will answer: a behavior the specification doesn't "
+        "settle, or a change to existing behavior it doesn't mention. Take the reading closest to the "
+        "specification's words, apply it, and list each call under the heading \"Owner-level decisions "
+        "taken\": the question, your decision, and why."
+        if decides else
+        "Owner-level calls are not yours: a behavior the specification doesn't settle, or a change to "
+        "existing behavior it doesn't mention. List each under the heading \"Needs owner\", with your "
+        "recommendation, and don't change it.")
+    landed_duty = ("End the report with a section under the heading \"As landed\": the exact text for the plan "
+                   "document (what shipped, each deviation from the specification, each residual, each "
+                   "measurement worth keeping), written so that it can be pasted." if writes_landed else "")
+    if decisions is not None:
+        decision_text = decisions.read_text(encoding="utf-8").strip()
+    elif stage == "fix":
+        decision_text = ("None were given: decide each item under \"Needs owner\" and \"Beyond\" in the earlier "
+                         "reports yourself, as the rule on owner-level calls says.")
+    else:
+        decision_text = ""
+    commands = plan.get("commands") or {}
+    values = {
+        "task_id": nid,
+        "task_title": str(n.get("title", "")),
+        "lane_worktree": str(n.get("lane") or root_dir(plan, "worktree_root", graph_path) / nid),
+        "lane_branch": str(n.get("branch") or f"{plan['branch_prefix']}{nid}"),
+        "integration_branch": str(plan["integration_branch"]),
+        "scratch": str(scratch),
+        "stage_tmp": str(tmp),
+        "report": str(report_file(scratch, nid, name)),
+        "guidelines": ", ".join(str(resolve_doc(str(g), graph_path)) for g in plan.get("guidelines") or []) or "none",
+        "prior_plans": ", ".join(str(resolve_doc(str(g), graph_path)) for g in plan.get("prior_plans") or []) or "none",
+        "commands": "; ".join(f"{k}: `{v}`" for k, v in commands.items()) or "see the gates",
+        "gates": ", then ".join(f"`{g}`" for g in plan.get("gates") or []),
+        "files": ", ".join(str(f) for f in n.get("files") or []) or "none listed",
+        "owner_decisions": _owner_decisions(n, autonomy),
+        "owner_rule": owner_rule,
+        "mutation_duty": mutation,
+        "landed_duty": landed_duty,
+        "context": str(context),
+        "spec": spec,
+        "decisions": decision_text,
+    }
+    tpl = templates()
+    text = tpl[tpl_name].replace("{{common header}}", tpl["header"].rstrip("\n"))
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", value)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    left = sorted(set(re.findall(r"\{\{[\w ]+\}\}", text)))
+    if left:
+        raise SystemExit(f"template {tpl_name} has unknown placeholders: {', '.join(left)}")
+    out = scratch / f"{nid}_{name}.prompt.md"
+    out.write_text(text, encoding="utf-8")
+    model, effort = model_for(plan, stage), effort_for(plan, stage)
+    applied = effort if via == "workflow" else "session"
+    with locked(graph_path):
+        fresh = load(graph_path)
+        append_log(by_id(fresh)[nid], f"stage={name} start model={model} effort={effort} applied={applied}")
+        save(graph_path, fresh)
+    if part == "fix":
+        launcher = (f"Part 2 of your review of task {nid}: your instructions are in {out}. Read that file and "
+                    f"follow it exactly.")
+    else:
+        launcher = (f"You are the {name} stage of task {nid}. Your complete instructions are in {out}. Read that "
+                    f"file first and follow it exactly; it is your whole task.")
+    return out, launcher
+
+
+# ── final report and cleanup ───────────────────────────────────────────────────
+
+def build_report(data: dict, graph_path: Path) -> str:
+    plan = data["plan"]
+    lines = [f"# Final report: {plan.get('title', '')}", "", f"Written {now()} by `plan.py report`.", "",
+             render(data), ""]
+    stage_totals: Counter = Counter()
+    for n in by_id(data).values():
+        scratch = lane_scratch(plan, graph_path, n["id"])
+        lines += [f"## {n['id']}: {n.get('title', '')}", "",
+                  f"Status {n.get('status')}; commit {n.get('commit') or '-'}; workflow "
+                  f"{' -> '.join(workflow_of(n, plan)) or 'none'}"
+                  + (f"; escalated ({n.get('escalate')})" if n.get("escalate") else "") + ".", ""]
+        runs = stage_runs(n, scratch)
+        if runs:
+            lines += ["| prompt | model | effort requested | effort applied | minutes |", "| --- | --- | --- | --- | --- |"]
+            for r in runs:
+                lines.append(f"| {r['name']} | {r['model'] or '-'} | {r['effort'] or '-'} | {r['applied'] or '-'} | "
+                             f"{r['minutes'] if r['minutes'] is not None else 'unfinished'} |")
+                if r["minutes"] is not None:
+                    stage_totals[r["name"]] += r["minutes"]
+            lines.append("")
+        for title, items in findings(n, plan, scratch).items():
+            for source, text in items:
+                lines += [f"**{title}** ({source}):", "", text, ""]
+        for line in n.get("log") or []:
+            if "abandoned:" in str(line):
+                lines += [f"Abandoned; the lane's work is saved at {str(line).split('abandoned:', 1)[1]}.", ""]
+    if stage_totals:
+        lines += ["## Agent minutes by prompt", ""]
+        lines += [f"- {k}: {v:.1f}" for k, v in sorted(stage_totals.items())]
+        lines.append(f"- total: {sum(stage_totals.values()):.1f}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+
+def clean(data: dict, graph_path: Path, nid: str | None) -> str:
+    """Remove scratch that is no longer needed; return what was reclaimed."""
+    plan = data["plan"]
+    root = root_dir(plan, "scratch_root", graph_path)
+    freed = 0
+    if nid is not None:
+        scratch = lane_scratch(plan, graph_path, nid)
+        for d in sorted(scratch.glob("stage-*")) if scratch.is_dir() else []:
+            freed += _size(d)
+            shutil.rmtree(d, ignore_errors=True)
+        return f"{nid}: reclaimed {freed / 1024:.0f} KiB of stage temp files in {scratch}"
+    open_lanes = [i for i, n in by_id(data).items() if n.get("status") in OPEN_STATUSES]
+    if open_lanes:
+        raise SystemExit(f"refused: lanes are still open: {', '.join(open_lanes)}")
+    if not (graph_path.parent / REPORT_NAME).exists():
+        raise SystemExit(f"refused: write the final report first (`plan.py report`); it replaces the stage reports")
+    blocked = {i for i, n in by_id(data).items() if n.get("status") == "blocked"}
+    kept = []
+    for lane in sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []:
+        if lane.name in blocked:
+            for item in lane.iterdir():
+                if item.name.endswith(".abandoned.patch"):
+                    kept.append(str(item))
+                    continue
+                freed += _size(item)
+                shutil.rmtree(item, ignore_errors=True) if item.is_dir() else item.unlink(missing_ok=True)
+        else:
+            freed += _size(lane)
+            shutil.rmtree(lane, ignore_errors=True)
+    if root.is_dir() and not any(root.iterdir()):
+        root.rmdir()
+    return (f"reclaimed {freed / 1024:.0f} KiB of scratch under {root}"
+            + (f"; kept the abandoned patches: {', '.join(kept)}" if kept else ""))
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -922,7 +1433,7 @@ def apply_landed(doc: Path, anchor: str, text: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("validate", "waves", "next", "render"):
+    for name in ("validate", "waves", "next", "render", "report"):
         p = sub.add_parser(name)
         p.add_argument("graph", type=Path)
     p = sub.add_parser("set")
@@ -932,19 +1443,29 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("lane")
     p.add_argument("graph", type=Path)
     p.add_argument("id")
-    p.add_argument("action", choices=("open", "integrate", "close", "abandon", "discard"))
-    p = sub.add_parser("excerpt")
-    p.add_argument("graph", type=Path)
-    p.add_argument("id")
+    p.add_argument("action", choices=("open", "integrate", "close", "land", "abandon", "discard"))
+    for name in ("excerpt", "findings"):
+        p = sub.add_parser(name)
+        p.add_argument("graph", type=Path)
+        p.add_argument("id")
     p = sub.add_parser("prompt")
     p.add_argument("graph", type=Path)
     p.add_argument("id")
-    p.add_argument("stage", choices=tuple(STAGE_NUMBER))
+    p.add_argument("stage", choices=STAGES)
+    p.add_argument("--part", choices=("report", "fix"))
     p.add_argument("--decisions", type=Path)
+    p.add_argument("--via", choices=("agent", "workflow"), default="agent")
+    p = sub.add_parser("context")
+    p.add_argument("graph", type=Path)
+    p.add_argument("id")
+    p.add_argument("--note", type=Path)
     p = sub.add_parser("landed")
     p.add_argument("graph", type=Path)
     p.add_argument("id")
-    p.add_argument("report", type=Path)
+    p.add_argument("report", type=Path, nargs="?")
+    p = sub.add_parser("clean")
+    p.add_argument("graph", type=Path)
+    p.add_argument("id", nargs="?")
     args = parser.parse_args(argv)
 
     graph_path: Path = args.graph.resolve()
@@ -961,6 +1482,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     data = load(graph_path)
+    plan = data["plan"]
+    if getattr(args, "id", None) and args.id not in by_id(data):
+        print(f"unknown node id: {args.id}", file=sys.stderr)
+        return 2
     if args.cmd == "validate":
         errors, warns = validate(data, graph_path)
         for w in warns:
@@ -985,41 +1510,47 @@ def main(argv: list[str] | None = None) -> int:
         if alone:
             print("runs alone: " + ", ".join(alone))
         todo = [n for n in items if n.get("status") not in FINISHED_STATUSES]
-        chains = Counter(chain_of(n) for n in todo)
-        agents = sum(len(CHAIN_STAGES.get(c, ())) * k for c, k in chains.items())
-        finals = sum(k for c, k in chains.items() if "final-review" in CHAIN_STAGES.get(c, ()))
-        print(f"agent runs for the {len(todo)} unfinished tasks: {agents} "
-              f"({finals} on the final-review model), before any reopened stage; chains: "
-              + ", ".join(f"{c} {k}" for c, k in sorted(chains.items())))
-        path, longest, total = critical_path(data)
-        print(f"estimated time: {longest:.0f} min on the critical path ({' -> '.join(path) or '-'}); "
-              f"{total:.0f} min if every task ran back to back")
+        flows: dict[str, list[str]] = {}
+        for n in todo:
+            flows.setdefault(" -> ".join(workflow_of(n, plan)) or "none (the coordinator)", []).append(
+                n["id"] + (f" (escalated: {n['escalate']})" if n.get("escalate") else ""))
+        for flow, ids in flows.items():
+            print(f"workflow {flow}: {', '.join(ids)}")
+        agents = sum(len([s for s in workflow_of(n, plan) if s != "fix"]) for n in todo)
+        fixes = sum(1 for n in todo if "fix" in workflow_of(n, plan))
+        print(f"agents for the {len(todo)} unfinished tasks: {agents} (a review stage is one agent given two prompts)"
+              + (f", plus up to {fixes} fix stages if findings are accepted" if fixes else ""))
+        records = load_timings(graph_path, plan)
+        makespan, peak, total = simulate(data, records)
+        measured = sum(task_minutes(n, plan, records)[1] for n in todo)
+        estimated = sum(task_minutes(n, plan, records)[2] for n in todo)
+        print(f"estimated time: {makespan:.0f} min with lane_cap {plan.get('lane_cap')} and the file exclusions, "
+              f"at most {peak} lane(s) at once; {total:.0f} min back to back "
+              f"({measured} stage estimates measured in this repository, {estimated} defaults)")
         hubs = Counter(f for n in todo for f in set(n.get("files") or []))
         shared = {f: [n["id"] for n in todo if f in (n.get("files") or [])] for f, k in hubs.items() if k > 1}
         if shared:
-            print("hub files (a seam task that lands their shared interface first lets these tasks run in parallel): "
+            print("hub files (tasks that list the same file never run together): "
                   + "; ".join(f"{f} ({', '.join(ids)})" for f, ids in sorted(shared.items())))
-        todo_ids = {n["id"] for n in todo}
-        layers = [[i for i in layer if i in todo_ids] for layer in waves(data)]
-        layers = [layer for layer in layers if layer]
-        if len(todo) >= 3 and all(len(layer) == 1 for layer in layers):
-            print("warning: the plan is serial; every wave holds one task, so no lanes run in parallel. "
-                  "Look for a seam task (SKILL.md, \"Seams\") before you execute.")
+        if len(todo) >= 3 and peak <= 1:
+            print("warning: the plan runs one lane at a time; dependencies or shared files serialize it. A seam "
+                  "task that gives each task its own files can let them run in parallel (SKILL.md, \"Seams\").")
         return 0
     if args.cmd == "next":
-        start, hold, slots = next_ready(data)
-        open_lanes = [n["id"] for n in by_id(data).values() if n.get("status") in OPEN_STATUSES]
+        start, hold, slots = next_ready(data, lane_changes(data, graph_path))
+        open_lanes = [f"{n['id']} ({n.get('status')})" for n in by_id(data).values() if n.get("status") in OPEN_STATUSES]
         print(f"free lane slots: {max(slots, 0)}; open lanes: {', '.join(open_lanes) or 'none'}")
         for n in start:
-            print(f"START {n['id']}: {n.get('title', '')} [{n.get('kind')}, {n.get('size')}, chain {chain_of(n)}: "
-                  f"{', '.join(CHAIN_STAGES.get(chain_of(n), ()))}]")
+            print(f"START {n['id']}: {n.get('title', '')} [{n.get('kind')}, {n.get('size')}; workflow "
+                  f"{' -> '.join(workflow_of(n, plan)) or 'none'}]")
         for nid, why in hold:
             print(f"HOLD  {nid}: {why}")
         if not start and not open_lanes:
             blocked = [i for i, n in by_id(data).items() if n.get("status") == "blocked"]
             print("FINISHED: no lane is open and nothing can start"
                   + (f"; blocked, for the user: {', '.join(blocked)}" if blocked else "")
-                  + ("; the HOLD lines above need the user" if hold else ""))
+                  + ("; the HOLD lines above need the user" if hold else "")
+                  + ". Next: `plan.py report`, then `plan.py clean`.")
         return 0
     if args.cmd == "render":
         print(render(data))
@@ -1028,29 +1559,63 @@ def main(argv: list[str] | None = None) -> int:
         print(lane_commands(data, graph_path, args.id, args.action))
         return 0
     if args.cmd == "prompt":
-        out, launcher = render_prompt(data, graph_path, args.id, args.stage, args.decisions)
+        out, launcher = render_prompt(data, graph_path, args.id, args.stage, args.part, args.decisions, args.via)
+        model, effort = model_for(plan, args.stage), effort_for(plan, args.stage)
+        note = "" if args.via == "workflow" or not effort else " (the Agent tool can't set effort; the session's applies)"
+        print(f"# model: {model or 'unset'}; effort requested: {effort or 'unset'}{note}")
         print(f"# prompt written to {out} ({len(out.read_text(encoding='utf-8'))} chars); give the agent this line:")
         print(launcher)
         return 0
+    if args.cmd == "context":
+        note = args.note.read_text(encoding="utf-8").strip() if args.note else None
+        print(f"brief written to {build_context(data, graph_path, args.id, note)}")
+        return 0
+    if args.cmd == "findings":
+        n = by_id(data)[args.id]
+        found = findings(n, plan, lane_scratch(plan, graph_path, args.id))
+        empty = True
+        for title, items in found.items():
+            for source, text in items:
+                empty = False
+                print(f"## {title} ({source})\n\n{text}\n")
+        if empty:
+            print(f"{args.id}: no Needs owner, Owner-level decisions, Beyond, or Residuals items")
+        return 0
     if args.cmd == "landed":
-        n = by_id(data).get(args.id)
-        if n is None:
-            print(f"unknown node id: {args.id}", file=sys.stderr)
-            return 2
-        text = as_landed_text(args.report)
+        n = by_id(data)[args.id]
+        report = args.report
+        if report is None:
+            scratch = lane_scratch(plan, graph_path, args.id)
+            report = next((r for r in reversed(task_reports(n, plan, scratch)) if report_section(r, "As landed")), None)
+            if report is None:
+                print(f"{args.id}: no report of this task has an \"As landed\" section", file=sys.stderr)
+                return 1
+        text = as_landed_text(report)
         doc, anchor = spec_target(n, data, graph_path)
         try:
             apply_landed(doc, anchor, text)
         except AnchorError as exc:
             print(f"{args.id}: {exc} in {doc}", file=sys.stderr)
             return 1
-        print(f"{args.id}: applied {len(text.splitlines())} lines of As landed text to {doc.name}")
+        recorded = record_timings(data, graph_path, args.id)
+        print(f"{args.id}: applied {len(text.splitlines())} lines of As landed text from {report.name} to {doc.name}; "
+              f"recorded {recorded} stage timings")
+        return 0
+    if args.cmd == "report":
+        for nid, n in by_id(data).items():
+            if n.get("status") in FINISHED_STATUSES:
+                record_timings(data, graph_path, nid)
+        out = graph_path.parent / REPORT_NAME
+        text = build_report(data, graph_path)
+        _write_atomic(out, text)
+        print(text)
+        print(f"# written to {out}; commit it, then run `plan.py clean` to reclaim the scratch space")
+        return 0
+    if args.cmd == "clean":
+        print(clean(data, graph_path, args.id))
         return 0
     if args.cmd == "excerpt":
-        n = by_id(data).get(args.id)
-        if n is None:
-            print(f"unknown node id: {args.id}", file=sys.stderr)
-            return 2
+        n = by_id(data)[args.id]
         doc, anchor = spec_target(n, data, graph_path)
         try:
             print(section(doc, anchor))

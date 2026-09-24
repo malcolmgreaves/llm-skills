@@ -6,20 +6,28 @@ plan:
   title: <plan title>
   spec: <plan document, .md or .html, relative to this file>
   integration_branch: main
-  worktree_root: ~/.local/state/git/worktrees/<repo>/lane   # lanes at <root>/<id>; relative = from this file
-  scratch_root: /path/with/room/lanes                        # reports and patches at <root>/<id>
+  worktree_root: ../<repo>-lanes/worktrees   # lanes at <root>/<id>; relative = from this file
+  scratch_root: ../<repo>-lanes/scratch      # per-lane scratch; plan.py clean reclaims it
   branch_prefix: lane/
   lane_cap: 3            # the machine sets this: one full build per lane
-  autonomy: 2            # 0 full control … 2 default (P1s, decisions, destructive) … 4 autonomous
+  autonomy: 2            # 0 full control … 2 default … 4 autonomous (owner-level calls reported)
   commit_policy: keep    # keep | squash
-  models:                # a cheaper model builds; the strongest one reviews
-    implement: <model id, e.g. sonnet>
-    review: <model id, e.g. opus>
-    fix: <model id, e.g. sonnet>
-    final_review: <model id, e.g. opus>
-  effort:
-    final_review: high
-  # stage_minutes: {implement: 3, review: 4.5, fix: 3.5, final_review: 1.5}   # S-task minutes for `waves`
+  coordinator: full      # full | merge | delegate: how much the coordinator reviews
+  workflow:              # the user picks these at draft time
+    S: [implement, review]
+    M: [implement, review, second_review]
+    L: [implement, review, second_review]   # add `fix` to end M or L with a fix stage
+  models:                # the user picks a model for every stage the workflows use
+    implement: <model id>
+    review: <model id>
+    second_review: <model id>
+    # fix: <model id>
+    # delegate: <model id>
+  effort:                # requested effort per stage: low | medium | high | xhigh | max
+    implement: <level>
+    review: <level>
+    second_review: <level>
+  # stage_minutes: {implement: 3, review: 3.5, second_review: 3}   # used until timings are measured
   commands:
     build: <command>
     test: <command>
@@ -42,12 +50,13 @@ nodes:
     title: <one line>
     spec: "#<short-id>"  # or "<other document>#<anchor>"
     kind: code           # code | docs | plan | measurement
-    # chain: default     # override: default | light | docs-only | none (S code runs light, M/L default)
+    # escalate: security # one size up: untrusted-input | persistence | security | concurrency | breaking-interface
+    # chain: none        # the coordinator does it itself (a seam, a plan edit)
     size: M              # S | M | L
     deps: []             # hard: must be done first
     soft_deps: []        # preferred order
-    files:               # every existing file the task changes, tests included
+    files:               # the files it is expected to change (a scheduling hint), tests included
       - <path>
     # alone: true        # runs with no other lane open (the default for kind: measurement)
     owner_decisions: []  # [{question: ..., default: ..., answer: ""}]
-    status: planned      # planned | running | review | integrating | done | blocked | skipped
+    status: planned      # planned | running | review | waiting | integrating | done | blocked | skipped
