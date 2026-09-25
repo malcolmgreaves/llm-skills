@@ -516,6 +516,46 @@ def test_report_and_clean(tmp_path):
     assert (scratch / "a.abandoned.patch").exists() and not plan.report_file(scratch, "a", "implement").exists()
 
 
+def test_empty_sections_are_not_findings(tmp_path):
+    report = tmp_path / "r.md"
+    for body in ("None.", "- None.", "None. The specification fully settles this task's behavior;\nno ambiguity.",
+                 "N/A: nothing to decide.", "Nothing to report."):
+        report.write_text(f"## Needs owner\n\n{body}\n")
+        assert plan.report_section(report, "Needs owner") is None, body
+    report.write_text("## Needs owner\n\n- Nonempty question: should --top print chars?\n")
+    assert plan.report_section(report, "Needs owner").startswith("- Nonempty question")
+
+
+def test_land_refuses_until_owner_items_are_decided(tmp_path):
+    graph_path = make_repo(tmp_path, autonomy=4)
+    wt = open_lane(graph_path)
+    commit_in_lane(wt)
+    finish_workflow(graph_path)
+    scratch = scratch_of(graph_path, "a")
+    plan.report_file(scratch, "a", "review-report").write_text(
+        "## Needs owner\n\n- Should --top also print chars? Recommend no.\n")
+    with pytest.raises(SystemExit, match="no decision is recorded.*your calls, since nobody answers at autonomy 4"):
+        cmds(graph_path, "a", "land")
+    plan.decisions_file(scratch, "a").write_text(
+        "## Owner-level decisions taken\n\n- --top prints only the word lines. Decided by the coordinator "
+        "(autonomy 4): the closest reading of the spec.\n")
+    assert "rebase" in cmds(graph_path, "a", "land")
+    assert plan.main(["report", str(graph_path)]) == 0
+    assert "Decided by the coordinator" in (graph_path.parent / "report.md").read_text()
+
+
+def test_clean_removes_the_empty_lane_roots(tmp_path):
+    lanes = tmp_path / "repo-lanes"
+    graph_path = make_repo(tmp_path, worktree_root=str(lanes / "worktrees"), scratch_root=str(lanes / "scratch"))
+    wt = open_lane(graph_path)
+    commit_in_lane(wt)
+    finish_workflow(graph_path)
+    assert run(cmds(graph_path, "a", "land")).returncode == 0
+    plan.main(["report", str(graph_path)])
+    plan.clean(plan.load(graph_path), graph_path, None)
+    assert not lanes.exists()
+
+
 # ── lanes ──────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("policy", ["keep", "squash"])

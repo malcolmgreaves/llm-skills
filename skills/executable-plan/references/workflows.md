@@ -101,7 +101,10 @@ reason, so the owner can review them later.
 | the last review's fix prompt | the coordinator mode is `merge` |
 
 `plan.py findings graph.yaml <id>` prints every "Needs owner", "Owner-level
-decisions taken", "Beyond", and "Residuals" item from the task's reports.
+decisions taken", "Beyond", and "Residuals" item from the task's reports and
+its decisions file. A task whose reports list "Needs owner" items doesn't land
+until a decision is recorded under "Owner-level decisions taken", by a stage
+or in the decisions file.
 
 ## Running a stage
 

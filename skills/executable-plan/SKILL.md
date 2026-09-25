@@ -188,9 +188,10 @@ decides what. One iteration:
    prompt yourself.
 4. When the workflow's last stage returns, run `plan.py findings graph.yaml
    <id>`. Owner-level items go to the user below autonomy 4 (the task waits
-   in `waiting`). In `full` mode you also decide the "Beyond" items. Accepted
-   items and owner answers go to the fix stage as a decisions file; with
-   none, skip it.
+   in `waiting`). In `full` mode you also decide the "Beyond" items. Record
+   every owner-level decision, whoever made it, under "Owner-level decisions
+   taken" in the task's decisions file; landing refuses until you do.
+   Accepted items and owner answers go to the fix stage; with none, skip it.
 5. `plan.py set graph.yaml <id> status=integrating`, then `plan.py lane
    graph.yaml <id> land`. It refuses a lane that isn't ready and says why.
    Otherwise it prints one command that rebases the lane, runs every gate,

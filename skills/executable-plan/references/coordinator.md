@@ -132,7 +132,14 @@ work.
 - **At autonomy 4.** Nobody waits. The actor in the table under
   `references/workflows.md`, "Owner-level decisions", makes each call and
   reports it under "Owner-level decisions taken", and `plan.py report`
-  collects them for the owner to review later.
+  collects them for the owner to review later. When that actor is you
+  (`full` mode), your report is the decisions file.
+
+Every decision is recorded. Write each one to `<scratch>/<id>_decisions.md`
+under the heading "Owner-level decisions taken": the question, the decision,
+who made it (the owner, or you at autonomy 4), and why. A decision said only
+in chat is lost: landing refuses a lane whose reports list "Needs owner"
+items until one is recorded, and `plan.py report` reads the file.
 
 ## Deciding findings (full mode)
 
@@ -162,6 +169,8 @@ the reason, if:
 - a `review_proof_` test remains
 - a report of a stage in the workflow is missing
 - the fix stage ran without a decisions file (below autonomy 4)
+- a report lists "Needs owner" items and no "Owner-level decisions taken" is
+  recorded
 - the lane has no commits
 - the main worktree is not on the integration branch
 
@@ -278,6 +287,7 @@ When `next` prints `FINISHED`:
    the repository's timings file, which later plans' `waves` estimates use.
 2. Commit `report.md` with the plan.
 3. `plan.py clean graph.yaml` removes the scratch root, keeping only the
-   patches of abandoned tasks.
+   patches of abandoned tasks, and removes the lane directories once they
+   are empty.
 4. Give the user the report's summary: what landed, what is blocked, and
    every owner-level decision taken without them.

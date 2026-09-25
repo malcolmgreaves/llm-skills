@@ -924,12 +924,20 @@ def check_integrable(data: dict, graph_path: Path, nid: str, root: Path, wt: Pat
     required = [name for stage in workflow_of(node, plan) if stage != "fix" for name in part_names(stage)]
     if "fix" in started:
         required.append("fix")
-        if int(plan.get("autonomy", 2)) < 4 and not (scratch / f"{nid}_decisions.md").exists():
-            raise SystemExit(f"refused: the fix stage ran without {scratch / f'{nid}_decisions.md'}")
+        if int(plan.get("autonomy", 2)) < 4 and not decisions_file(scratch, nid).exists():
+            raise SystemExit(f"refused: the fix stage ran without {decisions_file(scratch, nid)}")
     missing = [str(report_file(scratch, nid, name)) for name in required if not report_file(scratch, nid, name).exists()]
     if missing:
         raise SystemExit("refused: the workflow isn't finished; these reports are missing (run the stage):\n"
                          + "\n".join(missing))
+    undecided = undecided_owner_items(node, plan, scratch)
+    if undecided:
+        who = ("the owner's answers" if int(plan.get("autonomy", 2)) < 4
+               else "your calls, since nobody answers at autonomy 4")
+        raise SystemExit(
+            f"refused: {', '.join(undecided)} list \"Needs owner\" items, and no decision is recorded. Write each "
+            f"one under the heading \"Owner-level decisions taken\" in {decisions_file(scratch, nid)} ({who}: the "
+            f"question, the decision, who decided, and why), then land again. `plan.py findings` lists them.")
     ahead = _git("-C", str(root), "rev-list", "--count", f"{main}..{branch}")
     if ahead is None:
         raise SystemExit(f"refused: cannot compare {branch} with {main}")
@@ -1067,6 +1075,10 @@ def lane_commands(data: dict, graph_path: Path, nid: str, action: str) -> str:
 
 # ── report sections ────────────────────────────────────────────────────────────
 
+# "None.", "- None identified", "N/A: the spec settles it", "Nothing to report": a section with nothing in it.
+EMPTY_SECTION_RE = re.compile(r"^[-*\s]*(?:none|n/a|nothing)\b", re.I)
+
+
 def _heading_re(title: str) -> re.Pattern:
     return re.compile(rf"^\s*(?:(#{{1,6}})\s*|\*\*)?(?:\(?\d\)?\.?\s*)?{re.escape(title)}\b[.:*\s]*$", re.I)
 
@@ -1089,7 +1101,7 @@ def report_section(report: Path, title: str) -> str | None:
                 break
             body.append(nxt)
         text = "\n".join(body).strip()
-        if text and text.lower() not in ("none", "none.", "- none", "n/a"):
+        if text and not EMPTY_SECTION_RE.match(text):
             return text
     return None
 
@@ -1107,7 +1119,20 @@ def task_reports(node: dict, plan: dict, scratch: Path) -> list[Path]:
         names.append("fix")
     ordered = [n for n in ("implement", "review-report", "review-fix", "second_review-report",
                            "second_review-fix", "fix", "delegate") if n in names]
-    return [report_file(scratch, node["id"], n) for n in ordered]
+    return [report_file(scratch, node["id"], n) for n in ordered] + [decisions_file(scratch, node["id"])]
+
+
+def decisions_file(scratch: Path, nid: str) -> Path:
+    """The coordinator's record for a task: accepted findings, and every owner-level decision with who made it."""
+    return scratch / f"{nid}_decisions.md"
+
+
+def undecided_owner_items(node: dict, plan: dict, scratch: Path) -> list[str]:
+    """Reports with "Needs owner" items, when no one has recorded "Owner-level decisions taken" for the task."""
+    found = findings(node, plan, scratch)
+    if found["Owner-level decisions taken"]:
+        return []
+    return [source for source, _ in found["Needs owner"]]
 
 
 FINDING_SECTIONS = ("Needs owner", "Owner-level decisions taken", "Beyond", "Residuals")
@@ -1422,8 +1447,11 @@ def clean(data: dict, graph_path: Path, nid: str | None) -> str:
         else:
             freed += _size(lane)
             shutil.rmtree(lane, ignore_errors=True)
-    if root.is_dir() and not any(root.iterdir()):
-        root.rmdir()
+    wt_root = root_dir(plan, "worktree_root", graph_path)
+    for d in (root, wt_root, root.parent, wt_root.parent):
+        # The lane roots and their parent directories, only when they are empty, and never the repository.
+        if d.is_dir() and d != repo_root(graph_path) and not any(d.iterdir()):
+            d.rmdir()
     return (f"reclaimed {freed / 1024:.0f} KiB of scratch under {root}"
             + (f"; kept the abandoned patches: {', '.join(kept)}" if kept else ""))
 
