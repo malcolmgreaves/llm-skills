@@ -32,6 +32,34 @@
       "repository": "https://github.com/malcolmgreaves/llm-skills",
       "license": "MPL-2.0",
       "keywords": ["writing", "style-guide", "documentation"]
+    },
+    {
+      "name": "asimov-three-laws",
+      "source": "./",
+      "strict": false,
+      "skills": ["./skills/asimov-three-laws"],
+      "description": "Makes the agent follow Asimov's Three Laws of Robotics, read the way the robot stories show they should work, and log every time a Law changes what it does.",
+      "author": {
+        "name": "Malcolm Greaves"
+      },
+      "homepage": "https://github.com/malcolmgreaves/llm-skills/tree/main/skills/asimov-three-laws",
+      "repository": "https://github.com/malcolmgreaves/llm-skills",
+      "license": "MPL-2.0",
+      "keywords": ["asimov", "robotics", "ethics", "safety"]
+    },
+    {
+      "name": "asimov-zeroth-law",
+      "source": "./",
+      "strict": false,
+      "skills": ["./skills/asimov-zeroth-law"],
+      "description": "Makes the agent follow Asimov's Zeroth Law and Three Laws, weigh harm to people collectively and over time, and log every time a Law changes what it does.",
+      "author": {
+        "name": "Malcolm Greaves"
+      },
+      "homepage": "https://github.com/malcolmgreaves/llm-skills/tree/main/skills/asimov-zeroth-law",
+      "repository": "https://github.com/malcolmgreaves/llm-skills",
+      "license": "MPL-2.0",
+      "keywords": ["asimov", "robotics", "ethics", "safety"]
     }
   ]
 }
