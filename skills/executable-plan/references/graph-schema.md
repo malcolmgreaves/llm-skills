@@ -27,7 +27,8 @@ nodes:     # the tasks (a list)
 | `scratch_root` | path | yes | Each lane's scratch partition is `<scratch_root>/<id>`: prompts, reports, decisions, the brief, saved patches, and one `stage-<name>` temporary directory per prompt. Default to `../<repo>-lanes/scratch`. `plan.py clean` reclaims it. |
 | `branch_prefix` | string | yes | Lane branches are `<branch_prefix><id>`, for example `lane/`. |
 | `lane_cap` | integer ≥ 1 | yes | The most lanes that run at one time. Each lane builds with every core and owns a build directory, so the machine sets this. |
-| `autonomy` | integer 0–4 | yes | When the coordinator stops for the user. See `SKILL.md`. |
+| `autonomy` | integer 0–4 | yes | When the coordinator stops for the user. See `SKILL.md`. The user names it; `plan.py approve` records it. |
+| `approved` | string | runtime | The user's approval to start: a timestamp, the autonomy level, and the user's words. `plan.py approve` writes it; `lane open` refuses without it. |
 | `commit_policy` | `keep` or `squash` | yes | Whether a lane's commits land as they are (fast-forward) or as one commit. |
 | `workflow` | map | no | Size (`S`, `M`, `L`) to the list of stages its tasks run, in the order `implement`, `review`, `second_review`, `fix`; `review` is required. Defaults: S `[implement, review]`; M and L `[implement, review, second_review]`. The user picks these at draft time, including whether M and L end with `fix`. |
 | `models` | map | yes | Stage to model id, for every stage the workflows use: `implement`, `review`, `second_review`, `fix`, `delegate`, and `resolve` and `resolution_review` when overlap is on. The user picks them; `validate` refuses a missing one. |

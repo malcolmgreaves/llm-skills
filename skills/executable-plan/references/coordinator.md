@@ -26,7 +26,10 @@ graph's path in the repository.
 
 ## Before the first iteration
 
-1. `plan.py validate graph.yaml`. Fix every error.
+1. `plan.py validate graph.yaml`. Fix every error. Confirm that
+   `plan.approved` holds the user's approval: their words and the autonomy
+   level they named. `lane open` refuses without it. Never record an
+   approval the user didn't give, and never pick autonomy 4 for them.
 2. `plan.py render graph.yaml`. If any task is not `planned`, `done`,
    `skipped`, or `blocked`, this is a resumed campaign: follow "Resuming a
    campaign" first.
@@ -202,8 +205,9 @@ the rebase changed behavior: reopen the lane (`references/workflows.md`,
 
 ## Changing a setting during the run
 
-The user can change `file_overlap`, `dependency_overlap`, `lane_cap`, or
-`coordinator` at any time. A change alters which lanes open and which stages
+The user can change `file_overlap`, `dependency_overlap`, `lane_cap`,
+`coordinator`, or `autonomy` at any time. Only the user asks for a change;
+raising autonomy, in particular, needs their explicit request. A change alters which lanes open and which stages
 run, so it goes through a preview and a barrier:
 
 1. Run `plan.py preview graph.yaml <key>=<value> ...` and show the user its

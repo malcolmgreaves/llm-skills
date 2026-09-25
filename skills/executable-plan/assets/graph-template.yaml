@@ -10,7 +10,7 @@ plan:
   scratch_root: ../<repo>-lanes/scratch      # per-lane scratch; plan.py clean reclaims it
   branch_prefix: lane/
   lane_cap: 3            # the machine sets this: one full build per lane
-  autonomy: 2            # 0 full control … 2 default … 4 autonomous (owner-level calls reported)
+  autonomy: 2            # 0 full control … 4 autonomous; the user names it, and `plan.py approve` records it
   commit_policy: keep    # keep | squash
   coordinator: full      # full | merge | delegate: how much the coordinator reviews
   file_overlap: 2        # the most open lanes that can share one file; off (or 0) never shares

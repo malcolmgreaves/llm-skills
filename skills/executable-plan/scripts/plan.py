@@ -23,6 +23,7 @@ Usage:
     uv run plan.py clean GRAPH [ID]            # reclaim scratch space (a lane's, or the campaign's)
     uv run plan.py preview GRAPH key=value ... # compare a settings change with the current settings
     uv run plan.py configure GRAPH key=value ...   # lock in a settings change (refused while a stage runs)
+    uv run plan.py approve GRAPH --autonomy N --quote TEXT   # record the user's approval to start
 
 The script runs only read-only git commands. It prints every command that
 changes a repository for the coordinator to run, as one `&&` chain that
@@ -77,7 +78,7 @@ COORDINATOR_MODES = ("full", "merge", "delegate")
 DEPENDENCY_OVERLAP = ("off", "interfaces", "all")
 DEFAULT_FILE_OVERLAP = 2
 # Settings that `preview` compares and `configure` changes; each changes the schedule or the workflows.
-SETTINGS = ("file_overlap", "dependency_overlap", "lane_cap", "coordinator")
+SETTINGS = ("file_overlap", "dependency_overlap", "lane_cap", "coordinator", "autonomy")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 ESCALATIONS = ("untrusted-input", "persistence", "security", "concurrency", "breaking-interface")
 # Model-neutral minutes of agent time per stage for an S task, until measured timings exist.
@@ -487,6 +488,8 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
         errors.append("plan.file_overlap must be `off` or an integer >= 0: the most open lanes that may share one file")
     if dependency_overlap_of(plan) not in DEPENDENCY_OVERLAP:
         errors.append(f"plan.dependency_overlap must be one of {DEPENDENCY_OVERLAP}")
+    if plan.get("approved") is not None and not isinstance(plan.get("approved"), str):
+        errors.append("plan.approved must be a string (plan.py approve writes it)")
     if plan.get("changes") is not None and not isinstance(plan.get("changes"), list):
         errors.append("plan.changes must be a list (plan.py configure appends to it)")
     workflow = plan.get("workflow")
@@ -1181,6 +1184,11 @@ def lane_commands(data: dict, graph_path: Path, nid: str, action: str) -> str:
                 f"git -C {q(str(root))} commit -q -m \"plan: {nid} landed ($(git -C {q(str(root))} rev-parse --short HEAD))\" -- {paths}"]
 
     if action == "open":
+        if not plan.get("approved"):
+            raise SystemExit(
+                "refused: the plan isn't approved. Execution starts only after the user explicitly approves it, at "
+                "the autonomy level they name. Record their words with `plan.py approve graph.yaml --autonomy N "
+                "--quote \"<the user's words>\"`.")
         if n.get("status") != "planned":
             raise SystemExit(f"refused: {nid} is {n.get('status')}, not planned")
         steps = [f"git -C {q(str(root))} worktree add {q(str(wt))} -b {q(branch)} {q(main)}",
@@ -1619,7 +1627,7 @@ def parse_settings(assignments: list[str]) -> dict:
             raise SystemExit(f"expected key=value with a key from {SETTINGS}, got {a!r}")
         if key == "file_overlap":
             out[key] = "off" if value in ("off", "0") else int(value)
-        elif key == "lane_cap":
+        elif key in ("lane_cap", "autonomy"):
             out[key] = int(value)
         else:
             out[key] = value
@@ -1644,7 +1652,8 @@ def describe_settings(data: dict, graph_path: Path, records: list[dict]) -> list
     flows = sorted({" -> ".join(workflow_of(n, plan)) for n in todo if n.get("status") == "planned"})
     return [
         f"  settings: file_overlap {file_overlap_of(plan) or 'off'}, dependency_overlap "
-        f"{dependency_overlap_of(plan)}, lane_cap {plan.get('lane_cap')}, coordinator {plan.get('coordinator', 'full')}",
+        f"{dependency_overlap_of(plan)}, lane_cap {plan.get('lane_cap')}, coordinator {plan.get('coordinator', 'full')}, "
+        f"autonomy {plan.get('autonomy')}",
         f"  estimated time for the unfinished tasks: {makespan:.0f} min, at most {peak} lane(s) at once",
         f"  would start now: {', '.join(n['id'] for n in start) or 'nothing'}",
         f"  workflows of tasks not yet started: {'; '.join(flows) or 'none'}",
@@ -1691,6 +1700,25 @@ def configure(graph_path: Path, change: dict) -> str:
             plan["changes"].append(f"{now()} {k}: {before[k]} -> {v}")
         save(graph_path, data)
     return "locked in: " + ", ".join(f"{k}={v}" for k, v in change.items())
+
+
+def approve(graph_path: Path, autonomy: int, quote: str) -> str:
+    """Record the user's approval to start, in their words, at the autonomy level they named."""
+    if autonomy not in (0, 1, 2, 3, 4):
+        raise SystemExit("refused: --autonomy must be an integer from 0 to 4")
+    if not quote.strip():
+        raise SystemExit("refused: --quote must hold the user's own words approving the plan")
+    with locked(graph_path):
+        data = load(graph_path)
+        plan = data["plan"]
+        before = plan.get("autonomy")
+        plan["autonomy"] = autonomy
+        plan["approved"] = f"{now()} autonomy {autonomy}: {quote.strip()}"
+        if plan.get("changes") is None:
+            plan["changes"] = []
+        plan["changes"].append(f"{now()} approved at autonomy {autonomy} (was {before})")
+        save(graph_path, data)
+    return f"approved at autonomy {autonomy}; lanes can open"
 
 
 # ── final report and cleanup ───────────────────────────────────────────────────
@@ -1814,6 +1842,10 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("graph", type=Path)
         p.add_argument("settings", nargs="+")
+    p = sub.add_parser("approve")
+    p.add_argument("graph", type=Path)
+    p.add_argument("--autonomy", type=int, required=True)
+    p.add_argument("--quote", required=True)
     args = parser.parse_args(argv)
 
     graph_path: Path = args.graph.resolve()
@@ -1823,6 +1855,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "configure":
         print(configure(graph_path, parse_settings(args.settings)))
+        return 0
+    if args.cmd == "approve":
+        print(approve(graph_path, args.autonomy, args.quote))
         return 0
     if args.cmd == "set":
         with locked(graph_path):

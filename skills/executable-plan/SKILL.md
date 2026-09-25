@@ -101,7 +101,7 @@ read its guideline files first.
 | The model and effort for each stage | `models`, `effort` | The user's choice, always; nothing in the skill picks a model. Include `resolve` and `resolution_review` when overlap is on; recommend a mid-tier model for both. |
 | How much lanes may overlap | `file_overlap`, `dependency_overlap` | Defaults: `file_overlap: 2`, `dependency_overlap: off`. Always explain every option (below). |
 | The coordinator mode | `coordinator` | `full` (default), `merge`, or `delegate`: how much the coordinator reviews (`references/coordinator.md`). |
-| Autonomy (0 to 4, default 2) | `autonomy` | When the coordinator stops for the user (table under Mode 2). |
+| Autonomy (0 to 4; recommend 2) | `autonomy` | When the coordinator stops for the user (table under Mode 2). The user names the level; never pick 4 for them. |
 | Keep or squash lane commits | `commit_policy` | Keeping them keeps each stage's commit in the history. |
 
 **The tasks (one section each in the plan document).** For each task, write:
@@ -159,10 +159,22 @@ Show the user, in one message: the plan, the `waves` output, the workflow for
 each size with its models and effort, the overlap settings with every option
 explained, the coordinator mode, the autonomy level, and every owner question
 with your recommended default. Ask them to
-approve or change any of it. Ask even when the user says they will be away:
-"don't block me mid-run" is not "don't ask at all". Record answers with
-`plan.py set`. Iterate until the user approves the plan, then commit both
-files on the integration branch; execution starts from that commit.
+approve or change any of it, and to name the autonomy level to start at.
+Ask even when the user says they will be away: "don't block me mid-run" is
+not "don't ask at all". Record answers with `plan.py set`, and iterate until
+the user approves.
+
+**Starting execution.** Execution starts only with the user's explicit
+approval, at the autonomy level the user names. Never start on your own, and
+never choose autonomy 4 for the user: "I won't be around" is neither
+approval nor autonomy 4. If the user is unavailable and hasn't approved, stop
+after the draft and wait. The approval can come after the draft ("approved,
+start at autonomy 2") or in advance ("finish the draft, commit, then start at
+autonomy 3"); with advance approval, start right after the draft. Record it
+with `plan.py approve graph.yaml --autonomy <N> --quote "<the user's
+words>"`, then commit the plan document and `graph.yaml` on the integration
+branch; execution starts from that commit. `lane open` refuses until an
+approval is recorded.
 
 Derive the edges honestly:
 
@@ -250,7 +262,7 @@ waits for the user. Each level includes the stops of the levels above it.
 
 | Level | The coordinator stops for |
 | --- | --- |
-| 4, autonomous | Nothing. Owner-level calls are made in the workflow and reported in full. |
+| 4, autonomous | Nothing. Owner-level calls are made in the workflow and reported in full. Only when the user chose it. |
 | 3, decisions | Every owner-level decision, and any destructive action outside the protocol. |
 | 2, default | Level 3, plus a P1 finding in a review's report, before the fix prompt is sent. |
 | 1, findings | Level 2, plus every P2 finding. |
@@ -287,7 +299,7 @@ stage's model, effort, and duration, every owner-level decision taken, the
   Running lanes finish against their original spec; a new workflow, model,
   or coordinator mode applies to tasks that haven't started.
 - **The user changes a setting mid-run** (`file_overlap`,
-  `dependency_overlap`, `lane_cap`, `coordinator`). Show them `plan.py
+  `dependency_overlap`, `lane_cap`, `coordinator`, `autonomy`). Show them `plan.py
   preview graph.yaml <key>=<value> ...`, which compares the current and the
   proposed schedule, time, and workflows. After they approve, stop launching
   stages, wait for the stages in flight to return (the barrier), and run

@@ -74,6 +74,7 @@ def make_repo(tmp: Path, policy: str = "keep", gates: list | None = None, nodes:
             "title": "t", "spec": "plan.md", "integration_branch": "main",
             "worktree_root": str(tmp / "wt"), "scratch_root": str(tmp / "scratch"),
             "branch_prefix": "lane/", "lane_cap": 2, "autonomy": 2, "commit_policy": policy,
+            "approved": "2026-09-25T00:00:00 autonomy 2: approved for the test",
             "models": dict(MODELS), "effort": {"review": "high"}, "gates": gates or ["true"], **plan_extra,
         },
         "nodes": nodes or [
@@ -868,6 +869,24 @@ def test_preview_and_configure_change_settings_behind_a_barrier(tmp_path, capsys
     plan.save(graph_path, data)
     with pytest.raises(SystemExit, match="plan.models.resolve is missing"):
         plan.configure(graph_path, {"file_overlap": 3})
+
+
+def test_lanes_open_only_after_the_user_approves(tmp_path):
+    graph_path = make_repo(tmp_path)
+    data = plan.load(graph_path)
+    del data["plan"]["approved"]
+    plan.save(graph_path, data)
+    with pytest.raises(SystemExit, match="the plan isn't approved"):
+        cmds(graph_path, "a", "open")
+    with pytest.raises(SystemExit, match="--quote must hold the user's own words"):
+        plan.approve(graph_path, 3, "  ")
+    with pytest.raises(SystemExit, match="--autonomy must be an integer from 0 to 4"):
+        plan.approve(graph_path, 5, "go")
+    assert plan.main(["approve", str(graph_path), "--autonomy", "3", "--quote", "ok, commit and start at autonomy 3"]) == 0
+    p = plan.load(graph_path)["plan"]
+    assert p["autonomy"] == 3 and p["approved"].endswith("autonomy 3: ok, commit and start at autonomy 3")
+    assert "approved at autonomy 3 (was 2)" in p["changes"][-1]
+    assert "worktree add" in cmds(graph_path, "a", "open")
 
 
 def test_validate_checks_the_overlap_settings(tmp_path):
