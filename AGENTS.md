@@ -15,6 +15,7 @@ skills/<skill-name>/     one directory per skill
   scripts/               optional: executable code, run via bash
   references/            optional: docs the agent reads on demand
   assets/                optional: templates, fonts, images used in output
+  evals/                 optional: `claude plugin eval` cases (results/ is gitignored)
 template/                starter files for a new skill — not a loadable skill
 scripts/validate.py      spec linter for everything under skills/
 .claude-plugin/          Claude Code marketplace.json: one plugin per skill
@@ -150,7 +151,7 @@ Structure for progressive disclosure — the agent pays for what it loads:
 its dependencies are declared inline, so there is no venv to create or activate:
 
 ```bash
-uv run scripts/validate.py              # skills/*, template/, and marketplace.json
+uv run scripts/validate.py              # skills/*, template/, marketplace.json, shared blocks
 uv run scripts/validate.py skills/foo   # one directory
 uv run scripts/validate.py --strict     # warnings fail too
 ```
@@ -159,6 +160,23 @@ Errors are spec violations and broken links; warnings are conventions from this
 file. It exits non-zero on any error. Run it before every commit that touches a
 skill.
 
+## Shared content between skills
+
+Every skill is self-contained, so a family of related skills (for example
+`asimov-three-laws` and `asimov-zeroth-law`) duplicates the text they share.
+Wrap each duplicated passage in a marker pair, each marker on a line of its own:
+
+```markdown
+<!-- shared: family/topic -->
+...identical text...
+<!-- /shared -->
+```
+
+A whole file can be one block. When run on the whole repo, `validate.py` finds
+every block in every Markdown file under `skills/`. It fails when two copies
+of a key differ (and prints the diff) or when a marker is unbalanced. It warns
+when a key has only one copy. Edit one copy, then copy it to the others.
+
 ## Testing a skill
 
 The real test is behavioral, not structural: run a realistic prompt with the
@@ -166,6 +184,14 @@ skill installed and the same prompt without it, and compare. If the outputs are
 indistinguishable, the skill is not earning its context. Common causes, in order
 of frequency: the `description` never triggered, or the body only restated what
 the model already does by default.
+
+A skill can carry a [`claude plugin eval`](https://code.claude.com/docs/en/plugin-evals)
+suite in `skills/<skill-name>/evals/`: one directory per case, holding a
+`prompt.md` and a `graders/` directory. Running
+`claude plugin eval skills/<skill-name>` runs every case with and without the
+skill and reports the difference in score. Results go to `evals/results/`,
+which is gitignored. The skill's `README.md` gives the exact command, including
+any `--allow-tools` or `--scaffold` flags its cases need.
 
 ## Conventions
 

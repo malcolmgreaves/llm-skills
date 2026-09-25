@@ -12,6 +12,8 @@ claude.ai, the Claude API, and any other agent that implements the spec.
 | Skill | What it does |
 | --- | --- |
 | [google-developer-style](skills/google-developer-style/) | Rewrites all prose (replies, plans, commit messages, comments, docstrings, READMEs) to follow the Google developer documentation style guide: literal, second-person, active-voice, present-tense English with no figurative language or filler. |
+| [asimov-three-laws](skills/asimov-three-laws/) | Makes the agent follow Asimov's Three Laws of Robotics for the rest of the session, read the way the robot stories show they should work in practice: strict, centered on individual people, and escalating dilemmas to the user. Logs every time a Law changes what the agent does. |
+| [asimov-zeroth-law](skills/asimov-zeroth-law/) | Adds Asimov's Zeroth Law (do not harm humanity) above the Three Laws: weighs harm and benefit to people collectively and over time and handles gray areas openly, anchored by the lessons Asimov attached to the Zeroth Law. Logs every time a Law changes what the agent does. |
 | [executable-plan](skills/executable-plan/) | Drafts an executable plan (a plan document with one anchored section per task plus a `graph.yaml` of dependencies, touched files, and status) and executes it concurrently: one git worktree per ready task, an implement → adversarial-review → fix → final-review chain of agents per task, and a coordinator that decides findings and integrates each lane into `main`. |
 
 ## Layout

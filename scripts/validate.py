@@ -6,7 +6,7 @@
 """Validate skills in this repository against the Agent Skills specification.
 
 Usage:
-    uv run scripts/validate.py              # validate skills/, template/, and marketplace.json
+    uv run scripts/validate.py              # skills/, template/, marketplace.json, shared blocks
     uv run scripts/validate.py skills/foo   # validate specific directories
     uv run scripts/validate.py --strict     # treat warnings as failures
 
@@ -16,9 +16,11 @@ Spec: https://agentskills.io/specification
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import re
 import sys
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,6 +55,13 @@ MD_LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 BODY_LINE_WARN = 500
 REFERENCE_LINE_WARN = 300
 
+# Skills are self-contained, so a family of related skills duplicates the text
+# it shares. Each copy is wrapped in a marker pair with the same key, and every
+# copy of a key must be identical, so the duplicates cannot drift apart.
+SHARED_OPEN = re.compile(r"<!-- shared: ([a-z0-9][a-z0-9/_.-]*) -->")
+SHARED_CLOSE = "<!-- /shared -->"
+SHARED_DIFF_LINES = 20
+
 
 @dataclass
 class Report:
@@ -61,6 +70,7 @@ class Report:
     path: Path
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    label: str | None = None
 
     def error(self, message: str) -> None:
         self.errors.append(message)
@@ -298,6 +308,72 @@ def validate_marketplace(skill_dirs: list[Path]) -> Report:
     return report
 
 
+def validate_shared_blocks(skill_dirs: list[Path]) -> Report:
+    """Every copy of a shared block must match the others byte for byte.
+
+    A block is the lines between `<!-- shared: KEY -->` and `<!-- /shared -->`,
+    each on a line of its own, in any Markdown file under a skill directory."""
+    report = Report(path=REPO_ROOT / "skills", label="shared blocks")
+    copies: dict[str, list[tuple[Path, str]]] = defaultdict(list)
+
+    for directory in skill_dirs:
+        for path in sorted(directory.rglob("*.md")):
+            relative = path.relative_to(REPO_ROOT)
+            if "results" in path.relative_to(directory).parts:
+                continue  # eval output, not authored content
+            key: str | None = None
+            start = 0
+            seen: set[str] = set()
+            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+            for number, line in enumerate(lines, start=1):
+                opened = SHARED_OPEN.fullmatch(line.strip())
+                if opened:
+                    if key is not None:
+                        report.error(
+                            f"{relative}:{number}: shared block `{opened.group(1)}` "
+                            f"opens inside shared block `{key}`"
+                        )
+                        continue
+                    key, start = opened.group(1), number
+                    if key in seen:
+                        report.error(f"{relative}:{number}: shared block `{key}` appears twice")
+                    seen.add(key)
+                elif line.strip() == SHARED_CLOSE:
+                    if key is None:
+                        report.error(f"{relative}:{number}: `{SHARED_CLOSE}` has no opening marker")
+                        continue
+                    copies[key].append((relative, "".join(lines[start : number - 1])))
+                    key = None
+            if key is not None:
+                report.error(f"{relative}:{start}: shared block `{key}` is never closed")
+
+    for key, found in sorted(copies.items()):
+        if len(found) == 1:
+            report.warn(f"shared block `{key}` has only one copy ({found[0][0]})")
+            continue
+        reference_path, reference_text = found[0]
+        for path, text in found[1:]:
+            if text == reference_text:
+                continue
+            diff = list(
+                difflib.unified_diff(
+                    reference_text.splitlines(),
+                    text.splitlines(),
+                    fromfile=str(reference_path),
+                    tofile=str(path),
+                    lineterm="",
+                )
+            )
+            shown = "\n".join(f"        {line}" for line in diff[:SHARED_DIFF_LINES])
+            hidden = len(diff) - SHARED_DIFF_LINES
+            more = f"\n        ... {hidden} more diff lines" if hidden > 0 else ""
+            report.error(
+                f"shared block `{key}` differs between {reference_path} and {path}:\n{shown}{more}"
+            )
+
+    return report
+
+
 def discover(targets: list[str]) -> list[Path]:
     if targets:
         return [Path(t).resolve() for t in targets]
@@ -334,12 +410,18 @@ def main() -> int:
     reports = [validate_skill(d) for d in directories]
     if not args.targets:
         skills_dir = REPO_ROOT / "skills"
-        reports.append(validate_marketplace([d for d in directories if d.parent == skills_dir]))
+        skill_dirs = [d for d in directories if d.parent == skills_dir]
+        reports.append(validate_marketplace(skill_dirs))
+        reports.append(validate_shared_blocks(skill_dirs))
     error_count = sum(len(r.errors) for r in reports)
     warning_count = sum(len(r.warnings) for r in reports)
 
     for report in reports:
-        label = report.path.relative_to(REPO_ROOT) if report.path.is_relative_to(REPO_ROOT) else report.path
+        label = report.label or (
+            report.path.relative_to(REPO_ROOT)
+            if report.path.is_relative_to(REPO_ROOT)
+            else report.path
+        )
         if report.ok:
             print(f"ok    {label}")
             continue
