@@ -165,6 +165,14 @@ per task) and leaves only a line or two in the shared file, which the seam
 writes itself. The tasks then list only their own files and run in parallel.
 A seam that leaves every task editing the shared file changes nothing.
 
+A chain of dependencies serializes a plan too, and no seam helps with that.
+`waves` says which cause applies. When the dependencies form a chain, check
+each one: often the later task needs only part of the earlier task's
+result. Move that part into a small task of its own that depends on both,
+and the rest of the later task can start earlier. For example, a `--top`
+flag that must also appear in the `--json` output depends on the JSON task
+only for that combination; the combination can be its own task.
+
 ## Mode 2: execute the plan
 
 Read [references/coordinator.md](references/coordinator.md) before the first

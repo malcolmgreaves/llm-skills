@@ -101,9 +101,14 @@ reports the mismatch.
   `alone`, the lane cap) over estimated stage durations: the median of this
   repository's measured timings for the stage, size, model, and effort, else
   `stage_minutes`. It prints the finish time and the most lanes open at once.
-- **Hub files and serial plans**: `waves` names each file that several
-  unfinished tasks list, and warns when the schedule never runs two lanes at
-  once. Both are the cue for a seam task (`SKILL.md`, "Seams").
+- **Parallelism and its limits**: `waves` reruns the schedule without the
+  file exclusions and without the lane cap, and prints how many lanes the
+  dependencies alone allow, how many remain with the file exclusions, and
+  how many run with the cap. It lists the file conflicts that cost time:
+  task pairs that share a file and that no dependency orders. When the
+  schedule never runs two lanes at once, it names the cause (a chain of
+  dependencies, shared files, or the lane cap) and the fix for that cause
+  (`SKILL.md`, "Seams").
 - **Changed files**: `next` also excludes on the files each open lane has
   actually changed so far.
 - **Ready set**: status `planned`; `deps` all `done` or `skipped`; no

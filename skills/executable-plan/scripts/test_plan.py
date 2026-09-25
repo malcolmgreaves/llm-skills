@@ -323,20 +323,50 @@ def test_the_simulation_sees_file_exclusions_and_parallel_lanes():
     assert peak == 3 and makespan == pytest.approx(6.5)
 
 
-def test_waves_warns_when_shared_files_serialize_the_plan(tmp_path, capsys):
-    nodes = [
-        {"id": "a", "title": "t", "spec": "#a", "kind": "code", "size": "S", "files": ["cli.py"], "status": "planned"},
-        {"id": "b", "title": "t", "spec": "#b", "kind": "code", "size": "M", "files": ["cli.py"], "status": "planned"},
-        {"id": "c", "title": "t", "spec": "#residuals", "kind": "docs", "size": "S", "deps": ["b"], "files": ["cli.py", "README.md"], "status": "planned"},
-    ]
-    graph_path = make_repo(tmp_path, nodes=nodes)
+def waves_out(tmp_path: Path, capsys, nodes: list[dict], **plan_extra) -> str:
+    graph_path = make_repo(tmp_path, nodes=nodes, **plan_extra)
     plan.main(["waves", str(graph_path)])
-    out = capsys.readouterr().out
+    return capsys.readouterr().out
+
+
+def task(nid: str, spec: str, **kw) -> dict:
+    return {"id": nid, "title": "t", "spec": spec, "kind": "code", "size": "S", "status": "planned", **kw}
+
+
+def test_waves_names_shared_files_as_the_cause(tmp_path, capsys):
+    out = waves_out(tmp_path, capsys, [
+        task("a", "#a", files=["cli.py"]),
+        task("b", "#b", size="M", files=["cli.py"]),
+        task("c", "#residuals", kind="docs", deps=["b"], files=["cli.py", "README.md"]),
+    ])
     assert "wave 1: a, b" in out
     assert "workflow implement -> review: a, c" in out and "workflow implement -> review -> second_review: b" in out
     assert "at most 1 lane(s) at once" in out and "0 stage estimates measured" in out
-    assert "hub files (tasks that list the same file never run together): cli.py (a, b, c)" in out
-    assert "warning: the plan runs one lane at a time" in out
+    assert "parallelism: the dependencies allow 2 lane(s) at once; with the file exclusions, 1; with lane_cap 2, 1" in out
+    # b and c share cli.py too, but c depends on b, so that sharing costs nothing and isn't listed.
+    assert "file conflicts between tasks that no dependency orders: a x b (cli.py); a x c (cli.py); they cost" in out
+    assert "because tasks that no dependency orders share files" in out
+
+
+def test_waves_names_a_dependency_chain_as_the_cause(tmp_path, capsys):
+    out = waves_out(tmp_path, capsys, [
+        task("a", "#a", files=["a.py"]),
+        task("b", "#b", deps=["a"], files=["cli.py"]),
+        task("c", "#residuals", deps=["b"], files=["cli.py"]),
+    ])
+    assert "parallelism: the dependencies allow 1 lane(s) at once" in out
+    assert "file conflicts" not in out  # b and c share cli.py, but the dependency already orders them
+    assert "because the dependencies form a chain" in out and "Sharing fewer files won't change that" in out
+
+
+def test_waves_names_the_lane_cap_as_the_cause(tmp_path, capsys):
+    out = waves_out(tmp_path, capsys, [
+        task("a", "#a", files=["a.py"]),
+        task("b", "#b", files=["b.py"]),
+        task("c", "#residuals", files=["c.py"]),
+    ], lane_cap=1)
+    assert "the dependencies allow 3 lane(s) at once; with the file exclusions, 3; with lane_cap 1, 1" in out
+    assert "because lane_cap is 1" in out
 
 
 # ── prompts ────────────────────────────────────────────────────────────────────

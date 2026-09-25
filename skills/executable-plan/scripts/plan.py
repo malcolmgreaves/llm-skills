@@ -755,12 +755,15 @@ def next_ready(data: dict, changed: dict[str, set[str]] | None = None) -> tuple[
     return start, hold, slots
 
 
-def simulate(data: dict, records: list[dict]) -> tuple[float, int, float]:
+def simulate(data: dict, records: list[dict], use_files: bool = True,
+             lane_cap: int | None = None) -> tuple[float, int, float]:
     """(minutes to finish every unfinished task, most lanes open at once, minutes back to back).
 
     Runs the real scheduler (dependencies, file exclusions, `alone`, the lane
     cap) against estimated task durations. Open lanes restart from zero, and
-    owner questions count as answered.
+    owner questions count as answered. `use_files=False` ignores the file
+    exclusions, and `lane_cap` replaces the plan's cap, so the caller can see
+    what each constraint costs.
     """
     plan = data["plan"]
     nodes = {i: dict(n) for i, n in by_id(data).items()}
@@ -768,7 +771,12 @@ def simulate(data: dict, records: list[dict]) -> tuple[float, int, float]:
         if n.get("status") in OPEN_STATUSES:
             n["status"] = "planned"
         n["owner_decisions"] = []
-    sim = {"plan": {**plan, "autonomy": 4}, "nodes": list(nodes.values())}
+        if not use_files:
+            n["files"] = []
+    sim_plan = {**plan, "autonomy": 4}
+    if lane_cap is not None:
+        sim_plan["lane_cap"] = lane_cap
+    sim = {"plan": sim_plan, "nodes": list(nodes.values())}
     minutes = {i: task_minutes(n, plan, records)[0] for i, n in nodes.items()}
     clock, running, peak = 0.0, {}, 0
     while True:
@@ -784,6 +792,38 @@ def simulate(data: dict, records: list[dict]) -> tuple[float, int, float]:
         nodes[first]["status"] = "done"
     total = sum(m for i, m in minutes.items() if by_id(data)[i].get("status") not in FINISHED_STATUSES)
     return clock, peak, total
+
+
+def ancestors(data: dict) -> dict[str, set[str]]:
+    """Every task each task depends on, directly or through other tasks."""
+    nodes = by_id(data)
+    out: dict[str, set[str]] = {}
+
+    def visit(i: str) -> set[str]:
+        if i not in out:
+            out[i] = set()
+            for d in nodes[i].get("deps") or []:
+                if d in nodes:
+                    out[i] |= {d} | visit(d)
+        return out[i]
+
+    for i in nodes:
+        visit(i)
+    return out
+
+
+def file_conflicts(data: dict) -> list[tuple[str, str, list[str]]]:
+    """Unfinished task pairs that share files and that no dependency orders: the shared files keep them apart."""
+    todo = [n for n in by_id(data).values() if n.get("status") not in FINISHED_STATUSES]
+    before = ancestors(data)
+    out = []
+    for x in range(len(todo)):
+        for y in range(x + 1, len(todo)):
+            a, b = todo[x], todo[y]
+            shared = sorted(set(a.get("files") or []) & set(b.get("files") or []))
+            if shared and a["id"] not in before[b["id"]] and b["id"] not in before[a["id"]]:
+                out.append((a["id"], b["id"], shared))
+    return out
 
 
 # ── mutation of the graph file ─────────────────────────────────────────────────
@@ -1555,14 +1595,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"estimated time: {makespan:.0f} min with lane_cap {plan.get('lane_cap')} and the file exclusions, "
               f"at most {peak} lane(s) at once; {total:.0f} min back to back "
               f"({measured} stage estimates measured in this repository, {estimated} defaults)")
-        hubs = Counter(f for n in todo for f in set(n.get("files") or []))
-        shared = {f: [n["id"] for n in todo if f in (n.get("files") or [])] for f, k in hubs.items() if k > 1}
-        if shared:
-            print("hub files (tasks that list the same file never run together): "
-                  + "; ".join(f"{f} ({', '.join(ids)})" for f, ids in sorted(shared.items())))
+        # Rerun the schedule without each constraint, to name what limits the parallelism.
+        unbounded = max(len(todo), 1)
+        _, by_deps, _ = simulate(data, records, use_files=False, lane_cap=unbounded)
+        _, by_files, _ = simulate(data, records, lane_cap=unbounded)
+        no_files, _, _ = simulate(data, records, use_files=False)
+        print(f"parallelism: the dependencies allow {by_deps} lane(s) at once; with the file exclusions, {by_files}; "
+              f"with lane_cap {plan.get('lane_cap')}, {peak}")
+        conflicts = file_conflicts(data)
+        if conflicts:
+            print("file conflicts between tasks that no dependency orders: "
+                  + "; ".join(f"{a} x {b} ({', '.join(files)})" for a, b, files in conflicts)
+                  + (f"; they cost {makespan - no_files:.0f} min" if makespan - no_files >= 1 else ""))
         if len(todo) >= 3 and peak <= 1:
-            print("warning: the plan runs one lane at a time; dependencies or shared files serialize it. A seam "
-                  "task that gives each task its own files can let them run in parallel (SKILL.md, \"Seams\").")
+            if by_deps <= 1:
+                print("warning: the plan runs one lane at a time because the dependencies form a chain: each task "
+                      "needs the one before it. Sharing fewer files won't change that. For each dependency, check "
+                      "whether the later task needs all of the earlier task's result or only part of it. Move the "
+                      "part that needs it into a small task of its own, so the rest of the later task can start "
+                      "earlier (SKILL.md, \"Seams\").")
+            elif by_files <= 1:
+                print("warning: the plan runs one lane at a time because tasks that no dependency orders share "
+                      "files (listed above). A task that splits each shared file, so that each task writes its own "
+                      "file, lets them run in parallel (SKILL.md, \"Seams\").")
+            else:
+                print(f"warning: the plan runs one lane at a time because lane_cap is {plan.get('lane_cap')}; the "
+                      f"dependencies and files allow {by_files} lanes at once.")
         return 0
     if args.cmd == "next":
         start, hold, slots = next_ready(data, lane_changes(data, graph_path))
