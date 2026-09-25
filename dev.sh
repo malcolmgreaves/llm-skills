@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 cco auto \
+    --add-dir "${HOME}/.local/state/git/worktrees/llm-skills" \
     --add-dir "${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}" \
     --add-dir "${UV_TOOL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools}" \
     --add-dir "${UV_CREDENTIALS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/credentials}" \
