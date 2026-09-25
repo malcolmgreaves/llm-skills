@@ -30,9 +30,12 @@ nodes:     # the tasks (a list)
 | `autonomy` | integer 0–4 | yes | When the coordinator stops for the user. See `SKILL.md`. |
 | `commit_policy` | `keep` or `squash` | yes | Whether a lane's commits land as they are (fast-forward) or as one commit. |
 | `workflow` | map | no | Size (`S`, `M`, `L`) to the list of stages its tasks run, in the order `implement`, `review`, `second_review`, `fix`; `review` is required. Defaults: S `[implement, review]`; M and L `[implement, review, second_review]`. The user picks these at draft time, including whether M and L end with `fix`. |
-| `models` | map | yes | Stage to model id, for every stage the workflows use: `implement`, `review`, `second_review`, `fix`, `delegate`. The user picks them; `validate` refuses a missing one. |
+| `models` | map | yes | Stage to model id, for every stage the workflows use: `implement`, `review`, `second_review`, `fix`, `delegate`, and `resolve` and `resolution_review` when overlap is on. The user picks them; `validate` refuses a missing one. |
 | `effort` | map | no | Stage to the requested effort: `low`, `medium`, `high`, `xhigh`, `max`. Advisory where the runtime can't set it (the Agent tool can't); the log records what was applied. |
 | `coordinator` | `full`, `merge`, `delegate` | no | How much the coordinator reviews (`references/coordinator.md`). Default `full`. `delegate` adds a `delegate` stage to every workflow. |
+| `file_overlap` | integer ≥ 0 or `off` | no | The most open lanes that can list or change one file. Default `2`. `off` or `0` never opens two lanes on one file. With 2 or more, a landing can conflict and run the resolve stages. |
+| `dependency_overlap` | `off`, `interfaces`, `all` | no | Default `off`: a task starts after its dependencies land. `interfaces`: a task can start once a dependency in its `interface_deps` has started. `all`: once any dependency has started. A task always lands after its dependencies. |
+| `changes` | list of strings | runtime | `plan.py configure` appends one timestamped line per setting it changes. |
 | `stage_minutes` | map | no | Model-neutral minutes per stage for an S task, used by `waves` until this repository has measured timings. Defaults: implement 3, review 3.5, second_review 3, fix 2.5, delegate 2.5. M doubles them, L quadruples them. |
 | `timings` | path | no | Where measured stage timings are kept. Default: `executable-plan/timings.jsonl` in the repository's git directory, shared by every worktree and every plan in the repository. |
 | `commands` | map | no | `build`, `test`, `lint`, `check`, `run`: the project's commands, named in the lane prompts. |
@@ -52,12 +55,13 @@ nodes:     # the tasks (a list)
 | `size` | `S`, `M`, `L` | yes | Picks the workflow. S: a small, contained change. M: several files or a new component. L: the largest single task you allow. |
 | `escalate` | enum | no | Runs the workflow of the next size up. Only `untrusted-input`, `persistence`, `security`, `concurrency`, or `breaking-interface` (a breaking change to an existing public interface). |
 | `chain` | `none` | no | The coordinator does the task itself, with no lane (a seam, a plan edit, a merge). |
-| `deps` | list of ids | no | Hard dependencies. The task starts only when each one is `done`. |
+| `deps` | list of ids | no | Hard dependencies. The task starts when each one is `done`, or earlier under `dependency_overlap`; it lands only after each one is `done`. |
+| `interface_deps` | list of ids | no | The dependencies in `deps` whose specification fixes the interface this task uses. With `dependency_overlap: interfaces`, the task can start once they have started. |
 | `soft_deps` | list of ids | no | Preferred order. The task doesn't start while one of them is running or starting in the same round; it doesn't wait for one that can't start yet. |
 | `files` | list of paths | code: yes | The files the task is expected to change, tests included. A scheduling hint: two tasks with a common file never run at the same time. Agents may change other files when the work needs them; they report each one, and landing names it so the coordinator can add it. |
 | `alone` | bool | no | The task runs with no other lane open, and no lane opens until it has run. For a refactor that moves many files. Defaults to `true` for a `measurement` task, `false` otherwise. |
 | `owner_decisions` | list of maps | no | Each item: `question`, `default`, `answer` (empty until the user answers). At autonomy 4 the default is taken and reported; at 3 and below the task waits until `answer` is set. Record an answer with `plan.py set graph.yaml <id> "answer=<index from 0>:<text>"`. |
-| `status` | enum | yes | `planned` (not started), `running` (the workflow is running), `review` (the coordinator is deciding, or the fix stage is running), `waiting` (an owner-level question is with the user; the lane keeps its slot), `integrating`, `done`, `blocked` (abandoned; its dependents wait), `skipped` (counts as done for its dependents). `plan.py set` changes it. |
+| `status` | enum | yes | `planned` (not started), `running` (the workflow is running), `review` (the coordinator is deciding, or the fix stage is running), `waiting` (an owner-level question is with the user; the lane keeps its slot), `conflicted` (the landing's rebase conflicted; the resolve stages run), `integrating`, `done`, `blocked` (abandoned; its dependents wait), `skipped` (counts as done for its dependents). `plan.py set` changes it. |
 | `lane` | path | runtime | The worktree path while the lane is open; `close` and `abandon` clear it. |
 | `branch` | string | runtime | The lane branch while the lane is open; after `abandon`, `abandoned/<id>`, which keeps the lane's commits. |
 | `commit` | string | runtime | The integration commit once `done`. |
@@ -132,6 +136,8 @@ plan:
   autonomy: 2
   commit_policy: keep
   coordinator: full
+  file_overlap: 2
+  dependency_overlap: off
   workflow:
     S: [implement, review]
     M: [implement, review, second_review]
@@ -141,6 +147,8 @@ plan:
     review: opus
     second_review: opus
     fix: sonnet
+    resolve: sonnet
+    resolution_review: sonnet
   effort:
     implement: medium
     review: high

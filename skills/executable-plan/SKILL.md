@@ -15,7 +15,7 @@ description: >-
   coordinator agent. Not for a single change, a single code review, or a build
   tool's task runner.
 license: MPL-2.0
-compatibility: Requires git 2.20 or later (worktrees), Python 3.11 with uv for scripts/plan.py, and an agent runtime that can run subagents in the background.
+compatibility: Requires git 2.38 or later (worktrees, merge-tree), Python 3.11 with uv for scripts/plan.py, and an agent runtime that can run subagents in the background.
 metadata:
   version: "0.2.0"
   author: malcolmgreaves
@@ -72,9 +72,10 @@ removes its build output.
 A worktree doesn't isolate everything, and the skill covers the rest:
 
 - **Merges.** Two lanes that change the same file work in peace and
-  conflict when they land. That is what `files` is for: `next` never opens
-  two lanes whose expected files overlap, or whose actual changes so far
-  overlap.
+  conflict when they land. `files` controls that: `next` opens at most
+  `file_overlap` lanes that list the same file or have already changed it.
+  When a landing's rebase conflicts, the lane becomes `conflicted` and a
+  resolve stage rebases it and keeps both sides.
 - **Shared git state.** The stash, refs, and config are shared by every
   worktree, so nobody uses `git stash`, and each lane has its own branch.
 - **Anything outside the repository.** Each lane gets its own scratch
@@ -97,7 +98,8 @@ read its guideline files first.
 | Requirements | each task's `Acceptance` | They become tests and measurements. |
 | Where worktrees and scratch go, the lane cap, the branch prefix | `worktree_root`, `scratch_root`, `lane_cap`, `branch_prefix` | Put both roots next to the repository (`../<repo>-lanes/…`), or under `$TMPDIR` in a sandbox. The machine sets the cap. |
 | The workflow for each size, and whether M and L end with a fix stage | `workflow` | Most of the cost. Show the defaults (`references/workflows.md`). |
-| The model and effort for each stage | `models`, `effort` | The user's choice, always; nothing in the skill picks a model. |
+| The model and effort for each stage | `models`, `effort` | The user's choice, always; nothing in the skill picks a model. Include `resolve` and `resolution_review` when overlap is on; recommend a mid-tier model for both. |
+| How much lanes may overlap | `file_overlap`, `dependency_overlap` | Defaults: `file_overlap: 2`, `dependency_overlap: off`. Always explain every option (below). |
 | The coordinator mode | `coordinator` | `full` (default), `merge`, or `delegate`: how much the coordinator reviews (`references/coordinator.md`). |
 | Autonomy (0 to 4, default 2) | `autonomy` | When the coordinator stops for the user (table under Mode 2). |
 | Keep or squash lane commits | `commit_policy` | Keeping them keeps each stage's commit in the history. |
@@ -132,11 +134,31 @@ waves graph.yaml`. It prints the dependency waves, the file exclusions, each
 task's workflow, the agent count, and the time the real scheduler needs with
 the lane cap and the exclusions, from this repository's measured stage
 timings when it has them. It warns when the plan runs one lane at a time;
-look for a seam (below) before you accept that.
+look for a seam (below) before you accept that. Its "overlap options"
+section estimates the time of every overlap setting.
+
+**Overlap.** Two settings let lanes run together that would otherwise wait,
+at the cost of conflicts that a resolve stage fixes when a lane lands.
+Always tell the user which settings the plan uses and explain each option,
+including none, with its estimate from `waves`:
+
+- `file_overlap` (default `2`): the most open lanes that can share one
+  file. `off` (or `0`) never opens two lanes on the same file: no conflicts,
+  and tasks that share a file run one at a time. `2` or more lets them run
+  together; the second to land rebases onto the first, and a conflict costs
+  a resolve stage and a resolution review.
+- `dependency_overlap` (default `off`): `off` starts a task after its
+  dependencies land. `interfaces` also starts it once a dependency listed in
+  its `interface_deps` has started, when the specification fixes the
+  interface it uses. `all` does that for every dependency. The task still
+  lands after its dependencies; if a dependency lands with a different
+  interface than its spec said, the lane pays for a resolve stage, or for a
+  fix and a review when the difference is large.
 
 Show the user, in one message: the plan, the `waves` output, the workflow for
-each size with its models and effort, the coordinator mode, the autonomy
-level, and every owner question with your recommended default. Ask them to
+each size with its models and effort, the overlap settings with every option
+explained, the coordinator mode, the autonomy level, and every owner question
+with your recommended default. Ask them to
 approve or change any of it. Ask even when the user says they will be away:
 "don't block me mid-run" is not "don't ask at all". Record answers with
 `plan.py set`. Iterate until the user approves the plan, then commit both
@@ -149,9 +171,13 @@ Derive the edges honestly:
 - A **soft dependency** means the order improves quality but not
   correctness: `soft_deps`. The task doesn't start while one is running or
   starting, but it doesn't wait for one that can't start yet.
-- **Expected files** are a scheduling hint, not a fence: two tasks whose
-  `files` overlap never run at once. Agents may change any file the work
-  needs and report the unexpected ones. Set `alone: true` on a task that
+- **Expected files** are a scheduling hint, not a fence: at most
+  `file_overlap` open lanes list the same file. Agents may change any file
+  the work needs and report the unexpected ones.
+- An **interface dependency** is a hard dependency whose specification fixes
+  the interface the task uses (a function signature, an output format): list
+  it in `interface_deps` too, so `dependency_overlap: interfaces` can start
+  the task early. Set `alone: true` on a task that
   touches everything; a `measurement` task runs alone by default.
 - An **owner decision** is a question in `owner_decisions`, with your
   recommended default. Below autonomy 4 the task waits for the answer.
@@ -201,11 +227,18 @@ decides what. One iteration:
    taken" in the task's decisions file; landing refuses until you do.
    Accepted items and owner answers go to the fix stage; with none, skip it.
 5. `plan.py set graph.yaml <id> status=integrating`, then `plan.py lane
-   graph.yaml <id> land`. It refuses a lane that isn't ready and says why.
-   Otherwise it prints one command that rebases the lane, runs every gate,
-   lands it on the integration branch, removes the worktree and the branch,
-   cleans the lane's temporary files, applies the "As landed" text to the
-   plan document, and commits the plan. Go to step 1.
+   graph.yaml <id> land`. It refuses a lane that isn't ready and says why,
+   including a lane whose dependencies haven't landed. Otherwise it prints
+   one command that rebases the lane, runs every gate, lands it on the
+   integration branch, removes the worktree and the branch, cleans the
+   lane's temporary files, applies the "As landed" text to the plan
+   document, and commits the plan. Go to step 1.
+6. If the rebase would conflict, `land` prints a command that only marks
+   the lane `conflicted`, and no rebase starts. Run the resolve stage (`plan.py prompt ... resolve`), then
+   the resolution review (two prompts, like any review), and land again.
+   If the resolve stage escalates because the fix goes beyond the conflicted
+   hunks, run the fix stage with its escalation as the decisions, then the
+   task's last review stage, and land again.
 
 Run `plan.py set`, `plan.py prompt`, and the lane commands one at a time,
 never as parallel tool calls; launching agents in parallel is fine. When
@@ -253,6 +286,13 @@ stage's model, effort, and duration, every owner-level decision taken, the
   `graph.yaml` on the integration branch, run `validate`, and continue.
   Running lanes finish against their original spec; a new workflow, model,
   or coordinator mode applies to tasks that haven't started.
+- **The user changes a setting mid-run** (`file_overlap`,
+  `dependency_overlap`, `lane_cap`, `coordinator`). Show them `plan.py
+  preview graph.yaml <key>=<value> ...`, which compares the current and the
+  proposed schedule, time, and workflows. After they approve, stop launching
+  stages, wait for the stages in flight to return (the barrier), and run
+  `plan.py configure graph.yaml <key>=<value> ...`, which refuses while any
+  stage is in flight and records the change in the plan. Then resume.
 - **A resumed session.** Start with `plan.py render graph.yaml`, then follow
   the resume table in `references/coordinator.md`. Every status, stage
   start, and report is on disk.

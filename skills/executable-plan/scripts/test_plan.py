@@ -47,7 +47,8 @@ Body of b.
 - curly apostrophes split words
 """
 
-MODELS = {"implement": "sonnet", "review": "opus", "second_review": "opus", "fix": "sonnet", "delegate": "opus"}
+MODELS = {"implement": "sonnet", "review": "opus", "second_review": "opus", "fix": "sonnet", "delegate": "opus",
+          "resolve": "sonnet", "resolution_review": "sonnet"}
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -275,8 +276,8 @@ def test_who_makes_owner_level_calls_at_autonomy_4():
 
 # ── scheduling ─────────────────────────────────────────────────────────────────
 
-def sched(nodes: list[dict], cap: int = 3, autonomy: int = 2, changed=None) -> tuple[list[str], dict[str, str]]:
-    data = {"plan": {"lane_cap": cap, "autonomy": autonomy}, "nodes": nodes}
+def sched(nodes: list[dict], cap: int = 3, autonomy: int = 2, changed=None, **plan_kw) -> tuple[list[str], dict[str, str]]:
+    data = {"plan": {"lane_cap": cap, "autonomy": autonomy, "file_overlap": 0, **plan_kw}, "nodes": nodes}
     start, hold, _ = plan.next_ready(data, changed)
     return [x["id"] for x in start], dict(hold)
 
@@ -313,14 +314,47 @@ def test_next_respects_files_changes_waiting_owner_decisions_and_blocked_deps():
     assert hold == {"b": "waits for a (blocked)"}
 
 
+def test_next_lets_lanes_share_a_file_up_to_file_overlap():
+    start, hold = sched([n("a", files=["x"]), n("b", files=["x"]), n("c", files=["x"])], file_overlap=2)
+    assert start == ["a", "b"] and hold == {"c": "x is open in 2 lanes already (file_overlap 2)"}
+    start, hold = sched([n("a", status="running", files=["y"]), n("b", files=["x"])],
+                        changed={"a": {"x"}}, file_overlap=2)
+    assert start == ["b"]
+
+
+def test_next_starts_a_task_early_under_dependency_overlap():
+    nodes = lambda: [n("a", status="running"), n("b", deps=["a"], interface_deps=["a"]), n("c", deps=["a"])]
+    start, hold = sched(nodes())
+    assert start == [] and hold == {"b": "waits for a", "c": "waits for a"}
+    start, hold = sched(nodes(), dependency_overlap="interfaces")
+    assert start == ["b"] and hold == {"c": "waits for a"}
+    start, _ = sched(nodes(), dependency_overlap="all")
+    assert start == ["b", "c"]
+    start, _ = sched([n("a"), n("b", deps=["a"])], dependency_overlap="all")
+    assert start == ["a", "b"]  # a dependency that starts in the same round counts as open
+    start, hold = sched([n("a", deps=["z"]), n("z", status="blocked"), n("b", deps=["a"])], dependency_overlap="all")
+    assert start == [] and hold["b"] == "waits for a"
+
+
 def test_the_simulation_sees_file_exclusions_and_parallel_lanes():
-    data = {"plan": {"lane_cap": 3, "autonomy": 2},
+    data = {"plan": {"lane_cap": 3, "autonomy": 2, "file_overlap": 0},
             "nodes": [n("a", files=["cli.py"]), n("b", files=["cli.py"]), n("c", files=["cli.py"])]}
     makespan, peak, total = plan.simulate(data, [])
     assert peak == 1 and makespan == pytest.approx(total) == pytest.approx(3 * 6.5)
     data["nodes"] = [n("a", files=["a.py"]), n("b", files=["b.py"]), n("c", files=["c.py"])]
     makespan, peak, _ = plan.simulate(data, [])
     assert peak == 3 and makespan == pytest.approx(6.5)
+
+
+def test_the_simulation_charges_overlap_for_resolving():
+    shared = [n("a", files=["cli.py"]), n("b", files=["cli.py"])]
+    data = {"plan": {"lane_cap": 3, "autonomy": 2, "file_overlap": 2}, "nodes": shared}
+    makespan, peak, _ = plan.simulate(data, [])
+    assert peak == 2 and makespan == pytest.approx(6.5 + 4.0)  # b resolves after a lands (resolve 2 + review 2)
+    chain = [n("a"), n("b", deps=["a"])]
+    data = {"plan": {"lane_cap": 3, "autonomy": 2, "dependency_overlap": "all"}, "nodes": chain}
+    makespan, peak, _ = plan.simulate(data, [])
+    assert peak == 2 and makespan == pytest.approx(6.5 + 4.0 + 1e-6)
 
 
 def waves_out(tmp_path: Path, capsys, nodes: list[dict], **plan_extra) -> str:
@@ -338,7 +372,7 @@ def test_waves_names_shared_files_as_the_cause(tmp_path, capsys):
         task("a", "#a", files=["cli.py"]),
         task("b", "#b", size="M", files=["cli.py"]),
         task("c", "#residuals", kind="docs", deps=["b"], files=["cli.py", "README.md"]),
-    ])
+    ], file_overlap="off")
     assert "wave 1: a, b" in out
     assert "workflow implement -> review: a, c" in out and "workflow implement -> review -> second_review: b" in out
     assert "at most 1 lane(s) at once" in out and "0 stage estimates measured" in out
@@ -346,6 +380,7 @@ def test_waves_names_shared_files_as_the_cause(tmp_path, capsys):
     # b and c share cli.py too, but c depends on b, so that sharing costs nothing and isn't listed.
     assert "file conflicts between tasks that no dependency orders: a x b (cli.py); a x c (cli.py); they cost" in out
     assert "because tasks that no dependency orders share files" in out
+    assert "file_overlap off: 32 *" in out and "file_overlap 2: " in out and "dependency_overlap all:" in out
 
 
 def test_waves_names_a_dependency_chain_as_the_cause(tmp_path, capsys):
@@ -697,9 +732,14 @@ def test_abandon_mid_rebase_keeps_every_commit(tmp_path):
     finish_workflow(graph_path)
     (repo / "x.txt").write_text("main moved\n", encoding="utf-8")
     git(repo, "commit", "-qam", "unlisted edit")
-    assert run(cmds(graph_path, "a", "integrate")).returncode != 0  # the rebase conflicts
-    with pytest.raises(SystemExit, match="a rebase is in progress"):
+    out = cmds(graph_path, "a", "integrate")
+    assert "would conflict in: x.txt" in out and " rebase " not in out  # no rebase starts
+    assert run(out).returncode == 0 and node(graph_path, "a")["status"] == "conflicted"
+    assert not plan.rebase_in_progress(wt)
+    subprocess.run(["git", "-C", str(wt), "rebase", "main"], capture_output=True)  # a rebase stopped by hand
+    with pytest.raises(SystemExit, match="a rebase stopped at a conflict"):
         cmds(graph_path, "a", "integrate")
+    assert "A rebase onto the integration branch stopped at a conflict" in prompt_text(graph_path, "a", "resolve")
     out = run(cmds(graph_path, "a", "abandon"))
     assert out.returncode == 0, out.stderr
     patch = (tmp_path / "scratch" / "a" / "a.abandoned.patch").read_text()
@@ -734,6 +774,110 @@ def test_relative_roots_resolve_against_the_graph_directory(tmp_path):
     assert str(tmp_path / "scratch" / "a") in text
     _, warnings = plan.validate(plan.load(graph_path), graph_path)
     assert any("inside the repository" in w for w in warnings)
+
+
+def two_lanes_editing_one_file(tmp_path):
+    nodes = [
+        {"id": "a", "title": "first", "spec": "#a", "kind": "code", "size": "S", "files": ["x.txt"], "status": "planned"},
+        {"id": "b", "title": "second", "spec": "#b", "kind": "code", "size": "S", "files": ["x.txt"], "status": "planned"},
+    ]
+    graph_path = make_repo(tmp_path, nodes=nodes, file_overlap=2)
+    wa, wb = open_lane(graph_path, "a"), open_lane(graph_path, "b")
+    commit_in_lane(wa, "a", "base\nfrom a\n")
+    commit_in_lane(wb, "b", "base\nfrom b\n")
+    finish_workflow(graph_path, "a")
+    finish_workflow(graph_path, "b")
+    assert run(cmds(graph_path, "a", "land")).returncode == 0
+    return graph_path, wb
+
+
+def resolve_by_hand(graph_path: Path, wb: Path, report: str = "## Resolved\n\nx.txt: kept both lines\n") -> None:
+    """Do what a resolve stage does: rebase, keep both sides, commit, report."""
+    subprocess.run(["git", "-C", str(wb), "rebase", "main"], capture_output=True)
+    (wb / "x.txt").write_text("base\nfrom a\nfrom b\n")
+    git(wb, "add", "x.txt")
+    subprocess.run(["git", "-C", str(wb), "-c", "core.editor=true", "rebase", "--continue"], capture_output=True, check=True)
+    plan.report_file(scratch_of(graph_path, "b"), "b", "resolve").write_text(report)
+
+
+def test_a_conflicting_landing_goes_through_resolve_and_the_resolution_review(tmp_path):
+    graph_path, wb = two_lanes_editing_one_file(tmp_path)
+    out = cmds(graph_path, "b", "land")
+    assert "would conflict in: x.txt" in out
+    assert run(out).returncode == 0 and node(graph_path, "b")["status"] == "conflicted"
+    assert not plan.rebase_in_progress(wb)
+    resolve = prompt_text(graph_path, "b", "resolve")
+    assert "Rebasing the lane onto the integration branch conflicts" in resolve
+    assert "only stage allowed to rebase" in resolve
+    base, tip = (scratch_of(graph_path, "b") / "b_resolve-base.txt").read_text().split()
+    assert tip == git(wb, "rev-parse", "HEAD").strip()
+    resolve_by_hand(graph_path, wb)
+    with pytest.raises(SystemExit, match="resolution_review-report, resolution_review-fix"):
+        cmds(graph_path, "b", "land")
+    review = prompt_text(graph_path, "b", "resolution_review", "report")
+    assert f"range-diff {base}..{tip}" in review and "Don't judge the task's implementation" in review
+    prompt_text(graph_path, "b", "resolution_review", "fix")
+    for name in ("resolution_review-report", "resolution_review-fix"):
+        plan.report_file(scratch_of(graph_path, "b"), "b", name).write_text("## Findings\n\nNone.\n")
+    out = run(cmds(graph_path, "b", "land"))
+    assert out.returncode == 0, out.stderr + out.stdout
+    assert (graph_path.parent / "x.txt").read_text() == "base\nfrom a\nfrom b\n"
+
+
+def test_an_escalated_resolve_needs_the_fix_stage_and_the_normal_review(tmp_path):
+    graph_path, wb = two_lanes_editing_one_file(tmp_path)
+    run(cmds(graph_path, "b", "land"))
+    prompt_text(graph_path, "b", "resolve")
+    resolve_by_hand(graph_path, wb, "## Escalate\n\nThe landed change renamed the flag this task parses.\n")
+    with pytest.raises(SystemExit, match="fix, review-report, review-fix"):
+        cmds(graph_path, "b", "land")
+
+
+def test_a_lane_lands_after_its_dependencies(tmp_path):
+    nodes = [
+        {"id": "a", "title": "first", "spec": "#a", "kind": "code", "size": "S", "files": ["x.txt"], "status": "planned"},
+        {"id": "b", "title": "second", "spec": "#b", "kind": "code", "size": "S", "deps": ["a"],
+         "interface_deps": ["a"], "files": ["y.txt"], "status": "planned"},
+    ]
+    graph_path = make_repo(tmp_path, nodes=nodes, dependency_overlap="interfaces")
+    open_lane(graph_path, "a")
+    wb = open_lane(graph_path, "b")
+    commit_in_lane(wb, "b", "y\n", "y.txt")
+    finish_workflow(graph_path, "b")
+    with pytest.raises(SystemExit, match="b lands after its dependencies, and a has not landed"):
+        cmds(graph_path, "b", "land")
+
+
+def test_preview_and_configure_change_settings_behind_a_barrier(tmp_path, capsys):
+    graph_path = make_repo(tmp_path)
+    plan.main(["preview", str(graph_path), "file_overlap=off", "dependency_overlap=all"])
+    out = capsys.readouterr().out
+    assert "current:\n  settings: file_overlap 2, dependency_overlap off" in out
+    assert "proposed:\n  settings: file_overlap off, dependency_overlap all" in out
+    assert "would start now: a" in out
+    open_lane(graph_path)  # renders the implement prompt: a stage in flight
+    with pytest.raises(SystemExit, match="stages are in flight \\(a:implement\\)"):
+        plan.configure(graph_path, {"file_overlap": "off"})
+    plan.report_file(scratch_of(graph_path, "a"), "a", "implement").write_text("done")
+    assert plan.configure(graph_path, {"file_overlap": "off"}) == "locked in: file_overlap=off"
+    p = plan.load(graph_path)["plan"]
+    assert p["file_overlap"] == "off"
+    assert p["changes"][-1].endswith("file_overlap: None -> off")  # the key was absent, so the default applied
+    data = plan.load(graph_path)
+    del data["plan"]["models"]["resolve"]
+    plan.save(graph_path, data)
+    with pytest.raises(SystemExit, match="plan.models.resolve is missing"):
+        plan.configure(graph_path, {"file_overlap": 3})
+
+
+def test_validate_checks_the_overlap_settings(tmp_path):
+    graph_path = make_repo(tmp_path, file_overlap="sometimes", dependency_overlap="maybe")
+    data = plan.load(graph_path)
+    data["nodes"][1]["interface_deps"] = ["z"]
+    errors, _ = plan.validate(data, graph_path)
+    assert any("plan.file_overlap must be `off` or an integer" in e for e in errors)
+    assert any("plan.dependency_overlap must be one of" in e for e in errors)
+    assert "b: interface_deps lists 'z', which is not in deps" in errors
 
 
 def test_lane_changes_reports_committed_and_uncommitted_files(tmp_path):

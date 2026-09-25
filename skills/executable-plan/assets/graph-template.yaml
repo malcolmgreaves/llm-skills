@@ -13,6 +13,8 @@ plan:
   autonomy: 2            # 0 full control … 2 default … 4 autonomous (owner-level calls reported)
   commit_policy: keep    # keep | squash
   coordinator: full      # full | merge | delegate: how much the coordinator reviews
+  file_overlap: 2        # the most open lanes that can share one file; off (or 0) never shares
+  dependency_overlap: off   # off | interfaces | all: may a task start before its dependencies land?
   workflow:              # the user picks these at draft time
     S: [implement, review]
     M: [implement, review, second_review]
@@ -21,6 +23,8 @@ plan:
     implement: <model id>
     review: <model id>
     second_review: <model id>
+    resolve: <model id, mid-tier>              # needed when file_overlap > 1 or dependency_overlap is on
+    resolution_review: <model id, mid-tier>
     # fix: <model id>
     # delegate: <model id>
   effort:                # requested effort per stage: low | medium | high | xhigh | max
@@ -53,10 +57,11 @@ nodes:
     # escalate: security # one size up: untrusted-input | persistence | security | concurrency | breaking-interface
     # chain: none        # the coordinator does it itself (a seam, a plan edit)
     size: M              # S | M | L
-    deps: []             # hard: must be done first
+    deps: []             # hard: lands after these (and starts after them unless dependency_overlap allows)
+    # interface_deps: [] # deps whose spec fixes the interface this task uses (for dependency_overlap: interfaces)
     soft_deps: []        # preferred order
     files:               # the files it is expected to change (a scheduling hint), tests included
       - <path>
     # alone: true        # runs with no other lane open (the default for kind: measurement)
     owner_decisions: []  # [{question: ..., default: ..., answer: ""}]
-    status: planned      # planned | running | review | waiting | integrating | done | blocked | skipped
+    status: planned      # planned | running | review | waiting | conflicted | integrating | done | blocked | skipped

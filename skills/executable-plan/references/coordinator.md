@@ -16,6 +16,7 @@ graph's path in the repository.
 - Owner decisions and the `waiting` status
 - Deciding findings (full mode)
 - Landing a lane
+- Changing a setting during the run
 - Rules that prevent lane conflicts
 - Autonomy in practice
 - Giving up on a task
@@ -50,7 +51,7 @@ graph's path in the repository.
 ## The coordinator modes
 
 The user picks one at draft time (`plan.coordinator`) and can change it for
-tasks that haven't started.
+tasks that haven't started (see "Changing a setting during the run").
 
 | Mode | After a workflow finishes, the coordinator | Beyond items are decided by | Cost |
 | --- | --- | --- | --- |
@@ -87,6 +88,8 @@ when the task's last stage returns:
     accepted items -> write <scratch>/<id>_decisions.md, set review, run fix --decisions <file>
     then: plan.py set graph.yaml <id> status=integrating
           plan.py lane graph.yaml <id> land  # run it: integrate, close, record As landed, commit the plan
+    refused because a dependency hasn't landed: land it again after the dependency lands
+    the rebase conflicted (status conflicted): resolve, then the resolution review, then land again
     on a gate failure: see "Landing a lane"
 when a measurement task's stage returns:
     plan.py set graph.yaml <id> status=done, plan.py lane graph.yaml <id> close,
@@ -171,6 +174,8 @@ the reason, if:
 - the fix stage ran without a decisions file (below autonomy 4)
 - a report lists "Needs owner" items and no "Owner-level decisions taken" is
   recorded
+- a dependency of the task hasn't landed
+- the resolve stage ran, and the prompts it requires haven't run after it
 - the lane has no commits
 - the main worktree is not on the integration branch
 
@@ -195,12 +200,34 @@ were building, so first rerun that one gate by itself. If it fails again,
 the rebase changed behavior: reopen the lane (`references/workflows.md`,
 "Reopening a lane"), then land again.
 
+## Changing a setting during the run
+
+The user can change `file_overlap`, `dependency_overlap`, `lane_cap`, or
+`coordinator` at any time. A change alters which lanes open and which stages
+run, so it goes through a preview and a barrier:
+
+1. Run `plan.py preview graph.yaml <key>=<value> ...` and show the user its
+   output: the current and the proposed settings, the estimated time, which
+   tasks would start now, the workflows of tasks not yet started, and what
+   happens when a landing conflicts.
+2. After the user approves, you are the barrier: stop launching stages and
+   opening lanes, and wait until every stage in flight returns.
+3. Run `plan.py configure graph.yaml <key>=<value> ...`. It refuses while any
+   stage has started without a report, refuses a change that leaves errors
+   in the plan (for example overlap without `models.resolve`), and records
+   the change with a timestamp in `plan.changes`.
+4. Resume. Open lanes keep running; the new settings decide which lanes
+   open from now on. Every landing still waits for its dependencies, and a
+   conflicted landing still goes through the resolve stage, whatever the
+   settings.
+
 ## Rules that prevent lane conflicts
 
 - **The worktree isolates a lane while it works, not when it lands.** Two
-  lanes that change the same file conflict at the rebase. `files` exists so
-  that `next` never opens two such lanes at once, and `next` also excludes
-  on the files each open lane has actually changed so far.
+  lanes that change the same file conflict at the rebase. `next` opens at
+  most `file_overlap` lanes that list a file or have already changed it;
+  with `file_overlap: off`, never two. A conflict that happens anyway goes
+  through the resolve stage.
 - Agents may change any file the work needs. They report every file outside
   the task's `files` under "Unexpected files", and landing names them; add
   each to `files` before the next task starts.
@@ -262,6 +289,7 @@ finished. For each task that `render` shows open:
 | `waiting` | Any | Ask the user again; the questions are in `plan.py findings`. |
 | `review` | The fix report is missing | Rerun the fix stage with `--decisions <scratch>/<id>_decisions.md`. |
 | `review` or `integrating` | Every report exists | Run `plan.py lane graph.yaml <id> land`. It reports a rebase in progress, finishes a lane that already landed, or prints the full landing. |
+| `conflicted` | Any | Continue the resolve path (`references/workflows.md`, "Resolving a conflicted landing"): `land` names the prompts still missing after the resolve stage. |
 | `done` with `lane` set | Any | Run `close`, then `plan.py landed`, and commit. |
 
 ## Failure cases

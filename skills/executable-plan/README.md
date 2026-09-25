@@ -34,7 +34,7 @@ request outside a plan (use a review skill for that).
 
 ## Requirements
 
-- git 2.20 or later, for worktrees.
+- git 2.38 or later, for worktrees and `git merge-tree --write-tree`.
 - Python 3.11 with `uv`, for `scripts/plan.py` (`ruamel.yaml` is declared
   inline). POSIX only: `plan.py` locks the graph with `fcntl`.
 - An agent runtime that can run subagents in the background with a model id
@@ -86,6 +86,19 @@ record before the reviewer knows it must fix them, and a finding can't
 quietly shrink to what is easy to fix. The second review of an M or L task
 checks the first review, removes scope creep, and owns simplicity and fit,
 the concerns larger changes tend to spread.
+
+**Why overlap has two settings and a resolve stage.** Tasks that share a
+file, and tasks whose dependency hasn't landed, can run together if someone
+resolves the conflicts they cause. `file_overlap` (a number of lanes per
+file, default 2) and `dependency_overlap` (`off`, `interfaces`, `all`,
+default `off`) control each kind separately, because textual conflicts are
+cheap and interface mismatches are not. A conflicted landing runs a resolve
+stage, the only stage allowed to rebase, and then a resolution review that
+reads only the resolution's `git range-diff`. `land` detects a conflict with
+`git merge-tree` before it rebases, so no printed command cancels a rebase:
+safety hooks commonly block that command. Changing a setting mid-run goes
+through `plan.py preview` and `plan.py configure`, which refuses while any
+stage is in flight.
 
 **Why three coordinator modes.** The coordinator was 30% of the cost of the
 second behavioral test, and every lane waited on it. `merge` and `delegate`

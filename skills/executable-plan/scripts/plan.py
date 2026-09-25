@@ -21,6 +21,8 @@ Usage:
     uv run plan.py landed GRAPH ID [REPORT]    # paste the "As landed" text into the plan
     uv run plan.py report GRAPH                # write the final report next to graph.yaml
     uv run plan.py clean GRAPH [ID]            # reclaim scratch space (a lane's, or the campaign's)
+    uv run plan.py preview GRAPH key=value ... # compare a settings change with the current settings
+    uv run plan.py configure GRAPH key=value ...   # lock in a settings change (refused while a stage runs)
 
 The script runs only read-only git commands. It prints every command that
 changes a repository for the coordinator to run, as one `&&` chain that
@@ -51,8 +53,8 @@ from pathlib import Path
 
 from ruamel.yaml import YAML
 
-STATUSES = ("planned", "running", "review", "waiting", "integrating", "done", "blocked", "skipped")
-OPEN_STATUSES = ("running", "review", "waiting", "integrating")
+STATUSES = ("planned", "running", "review", "waiting", "conflicted", "integrating", "done", "blocked", "skipped")
+OPEN_STATUSES = ("running", "review", "waiting", "conflicted", "integrating")
 FINISHED_STATUSES = ("done", "skipped")
 KINDS = ("code", "docs", "plan", "measurement")
 SIZES = ("S", "M", "L")
@@ -63,19 +65,25 @@ PLAN_REQUIRED = (
 )
 # Stages in the only order a workflow may use them. `delegate` is added by the coordinator mode.
 WORKFLOW_STAGES = ("implement", "review", "second_review", "fix")
-STAGES = WORKFLOW_STAGES + ("delegate",)
-TWO_PART = ("review", "second_review")  # a report prompt, then a fix prompt, to the same agent
+# `delegate` is added by the coordinator mode. `resolve` and `resolution_review` run only when a landing conflicts.
+STAGES = WORKFLOW_STAGES + ("delegate", "resolve", "resolution_review")
+TWO_PART = ("review", "second_review", "resolution_review")  # a report prompt, then a fix prompt, to the same agent
 DEFAULT_WORKFLOW = {
     "S": ["implement", "review"],
     "M": ["implement", "review", "second_review"],
     "L": ["implement", "review", "second_review"],
 }
 COORDINATOR_MODES = ("full", "merge", "delegate")
+DEPENDENCY_OVERLAP = ("off", "interfaces", "all")
+DEFAULT_FILE_OVERLAP = 2
+# Settings that `preview` compares and `configure` changes; each changes the schedule or the workflows.
+SETTINGS = ("file_overlap", "dependency_overlap", "lane_cap", "coordinator")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 ESCALATIONS = ("untrusted-input", "persistence", "security", "concurrency", "breaking-interface")
 # Model-neutral minutes of agent time per stage for an S task, until measured timings exist.
 # M doubles them, L quadruples them. plan.stage_minutes overrides them.
-STAGE_MINUTES = {"implement": 3.0, "review": 3.5, "second_review": 3.0, "fix": 2.5, "delegate": 2.5}
+STAGE_MINUTES = {"implement": 3.0, "review": 3.5, "second_review": 3.0, "fix": 2.5, "delegate": 2.5,
+                 "resolve": 2.0, "resolution_review": 2.0}
 SIZE_FACTOR = {"S": 1, "M": 2, "L": 4}
 SELF = Path(__file__).resolve()
 TEMPLATES = SELF.parent.parent / "assets" / "stage-templates.md"
@@ -172,6 +180,30 @@ def workflow_of(node: dict, plan: dict) -> list[str]:
     if plan.get("coordinator", "full") == "delegate":
         stages.append("delegate")
     return stages
+
+
+def file_overlap_of(plan: dict) -> int:
+    """The most open lanes that may share one file; 0 or 1 means no sharing."""
+    value = plan.get("file_overlap", DEFAULT_FILE_OVERLAP)
+    if value is False or value == "off":  # YAML 1.1 readers turn an unquoted `off` into False
+        return 0
+    if value is True:
+        return DEFAULT_FILE_OVERLAP
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0  # validate reports the bad value
+
+
+
+def dependency_overlap_of(plan: dict) -> str:
+    value = plan.get("dependency_overlap", "off")
+    return "off" if value is False else str(value)
+
+
+def overlap_enabled(plan: dict) -> bool:
+    """True if lanes can conflict at landing because of overlap, so the resolve stages must be configured."""
+    return file_overlap_of(plan) >= 2 or dependency_overlap_of(plan) != "off"
 
 
 def last_review(stages: list[str]) -> str | None:
@@ -450,6 +482,13 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
         errors.append("plan.commit_policy must be 'keep' or 'squash'")
     if plan.get("coordinator", "full") not in COORDINATOR_MODES:
         errors.append(f"plan.coordinator must be one of {COORDINATOR_MODES}")
+    overlap = plan.get("file_overlap", DEFAULT_FILE_OVERLAP)
+    if not (overlap in ("off", False) or (isinstance(overlap, int) and not isinstance(overlap, bool) and overlap >= 0)):
+        errors.append("plan.file_overlap must be `off` or an integer >= 0: the most open lanes that may share one file")
+    if dependency_overlap_of(plan) not in DEPENDENCY_OVERLAP:
+        errors.append(f"plan.dependency_overlap must be one of {DEPENDENCY_OVERLAP}")
+    if plan.get("changes") is not None and not isinstance(plan.get("changes"), list):
+        errors.append("plan.changes must be a list (plan.py configure appends to it)")
     workflow = plan.get("workflow")
     if workflow is not None:
         if not isinstance(workflow, dict):
@@ -515,7 +554,7 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
         if n.get("status") not in STATUSES:
             errors.append(f"{nid}: status must be one of {STATUSES}")
         lists_ok = True
-        for key in ("deps", "soft_deps", "files", "owner_decisions"):
+        for key in ("deps", "soft_deps", "files", "owner_decisions", "interface_deps"):
             value = n.get(key)
             if value is not None and not isinstance(value, list):
                 errors.append(f"{nid}: {key} must be a list")
@@ -531,6 +570,9 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
             for od in n.get("owner_decisions") or []:
                 if not isinstance(od, dict) or "question" not in od or "default" not in od:
                     errors.append(f"{nid}: each owner_decisions item needs `question` and `default`")
+            for dep in n.get("interface_deps") or []:
+                if dep not in (n.get("deps") or []):
+                    errors.append(f"{nid}: interface_deps lists {dep!r}, which is not in deps")
         if n.get("kind") == "code" and not n.get("files"):
             warnings.append(f"{nid}: a code task with no `files` cannot be excluded from a conflicting lane")
         if isinstance(plan, dict) and n.get("size") in SIZES:
@@ -548,6 +590,10 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
                     section(doc, anchor)
                 except AnchorError as exc:
                     errors.append(f"{nid}: {exc} in {doc.name}")
+    if overlap_enabled(plan):
+        used_stages |= {"resolve", "resolution_review"}
+    if dependency_overlap_of(plan) == "interfaces" and not any(n.get("interface_deps") for n in nodes):
+        warnings.append("plan.dependency_overlap is `interfaces`, but no task lists interface_deps, so it has no effect")
     models = plan.get("models") or {}
     for stage in sorted(used_stages & set(STAGES), key=STAGES.index):
         if not models.get(stage):
@@ -690,8 +736,25 @@ def next_ready(data: dict, changed: dict[str, set[str]] | None = None) -> tuple[
     """(tasks to start now, [(held task, reason)], free slots).
 
     `changed` maps an open lane to the files it has actually changed, which
-    exclude other tasks as its listed `files` do.
+    exclude other tasks as its listed `files` do. Under dependency overlap, a
+    task whose dependency starts in the same round can start too, so the
+    ready set is recomputed until it stops changing.
     """
+    result = _next_ready(data, changed, set())
+    for _ in range(len(data["nodes"])):
+        if dependency_overlap_of(data["plan"]) == "off":
+            break
+        starting = {n["id"] for n in result[0]}
+        again = _next_ready(data, changed, starting)
+        if {n["id"] for n in again[0]} == starting:
+            break
+        result = again
+    return result
+
+
+def _next_ready(data: dict, changed: dict[str, set[str]] | None,
+                starting: set[str]) -> tuple[list[dict], list[tuple[str, str]], int]:
+    """One pass of `next_ready`, counting the tasks in `starting` as open dependencies."""
     plan = data["plan"]
     nodes = by_id(data)
     done = {i for i, n in nodes.items() if n.get("status") in FINISHED_STATUSES}
@@ -706,9 +769,19 @@ def next_ready(data: dict, changed: dict[str, set[str]] | None = None) -> tuple[
         soft_open = sum(1 for d in n.get("soft_deps") or [] if d not in done)
         return (soft_open, -{"L": 3, "M": 2, "S": 1}.get(n.get("size"), 1), n["id"])
 
+    overlap = dependency_overlap_of(plan)
+
+    def dep_met(n: dict, d: str) -> bool:
+        # With dependency overlap, an open dependency lets the task start; it still lands after the dependency.
+        if d in done:
+            return True
+        if d not in starting and nodes.get(d, {}).get("status") not in OPEN_STATUSES:
+            return False
+        return overlap == "all" or (overlap == "interfaces" and d in (n.get("interface_deps") or []))
+
     eligible: list[dict] = []
     for n in sorted((n for n in nodes.values() if n.get("status") == "planned"), key=rank):
-        missing = [d for d in n.get("deps") or [] if d not in done]
+        missing = [d for d in n.get("deps") or [] if not dep_met(n, d)]
         if missing:
             labels = [f"{d} (blocked)" if d in blocked else d for d in missing]
             hold.append((n["id"], "waits for " + ", ".join(labels)))
@@ -733,13 +806,19 @@ def next_ready(data: dict, changed: dict[str, set[str]] | None = None) -> tuple[
         return [alone], hold + [(n["id"], f"`{alone['id']}` runs alone") for n in others], slots
 
     start: list[dict] = []
-    taken = {f for n in running for f in (n.get("files") or [])}
-    for files in (changed or {}).values():
-        taken |= files
+    limit = max(1, file_overlap_of(plan))
+    users: Counter = Counter()  # file -> open lanes that list it or have changed it
+    for r in running:
+        for f in set(r.get("files") or []) | (changed or {}).get(r["id"], set()):
+            users[f] += 1
     for n in eligible:
-        shared = sorted(set(n.get("files") or []) & taken)
-        if shared:
-            hold.append((n["id"], "shares files with an open lane: " + ", ".join(shared[:3]) + (" ..." if len(shared) > 3 else "")))
+        crowded = sorted(f for f in set(n.get("files") or []) if users[f] >= limit)
+        if crowded:
+            if limit == 1:
+                reason = "shares files with an open lane: " + ", ".join(crowded[:3]) + (" ..." if len(crowded) > 3 else "")
+            else:
+                reason = f"{crowded[0]} is open in {users[crowded[0]]} lanes already (file_overlap {limit})"
+            hold.append((n["id"], reason))
             continue
         # A soft dependency orders work: the task waits while one is running or
         # starting, but not for one that can't start yet.
@@ -751,19 +830,24 @@ def next_ready(data: dict, changed: dict[str, set[str]] | None = None) -> tuple[
             hold.append((n["id"], "no free lane slot"))
             continue
         start.append(n)
-        taken |= set(n.get("files") or [])
+        for f in set(n.get("files") or []):
+            users[f] += 1
     return start, hold, slots
 
 
-def simulate(data: dict, records: list[dict], use_files: bool = True,
-             lane_cap: int | None = None) -> tuple[float, int, float]:
+def simulate(data: dict, records: list[dict], use_files: bool = True, lane_cap: int | None = None,
+             settings: dict | None = None) -> tuple[float, int, float]:
     """(minutes to finish every unfinished task, most lanes open at once, minutes back to back).
 
     Runs the real scheduler (dependencies, file exclusions, `alone`, the lane
     cap) against estimated task durations. Open lanes restart from zero, and
     owner questions count as answered. `use_files=False` ignores the file
-    exclusions, and `lane_cap` replaces the plan's cap, so the caller can see
-    what each constraint costs.
+    exclusions, `lane_cap` replaces the plan's cap, and `settings` replaces
+    plan settings, so the caller can see what each constraint costs.
+
+    A lane lands only after its dependencies. A lane that was open while a
+    lane sharing one of its files landed, or that started before a dependency
+    landed, pays for a resolve stage and a resolution review.
     """
     plan = data["plan"]
     nodes = {i: dict(n) for i, n in by_id(data).items()}
@@ -773,12 +857,20 @@ def simulate(data: dict, records: list[dict], use_files: bool = True,
         n["owner_decisions"] = []
         if not use_files:
             n["files"] = []
-    sim_plan = {**plan, "autonomy": 4}
+    sim_plan = {**plan, **(settings or {}), "autonomy": 4}
     if lane_cap is not None:
         sim_plan["lane_cap"] = lane_cap
     sim = {"plan": sim_plan, "nodes": list(nodes.values())}
-    minutes = {i: task_minutes(n, plan, records)[0] for i, n in nodes.items()}
-    clock, running, peak = 0.0, {}, 0
+    minutes = {i: task_minutes(n, sim_plan, records)[0] for i, n in nodes.items()}
+    resolving = {i: sum(stage_estimate(sim_plan, records, s, effective_size(n))[0]
+                        for s in ("resolve", "resolution_review")) for i, n in nodes.items()}
+    clock, running, peak, conflicted = 0.0, {}, 0, set()
+
+    def charge(i: str) -> None:
+        if i not in conflicted:
+            conflicted.add(i)
+            running[i] += resolving[i]
+
     while True:
         start, _, _ = next_ready(sim)
         for n in start:
@@ -788,8 +880,18 @@ def simulate(data: dict, records: list[dict], use_files: bool = True,
         if not running:
             break
         first = min(running, key=running.get)
+        waiting_on = [d for d in nodes[first].get("deps") or [] if d in running]
+        if waiting_on:  # it lands after its dependencies, then rebases onto them
+            running[first] = max(running[d] for d in waiting_on) + 1e-6  # strictly after, so the dependency lands first
+            charge(first)
+            continue
         clock = running.pop(first)
         nodes[first]["status"] = "done"
+        for other in running:
+            # An open lane that shares a file with the landed lane, or depends on it, rebases onto its change.
+            if (set(nodes[first].get("files") or []) & set(nodes[other].get("files") or [])
+                    or first in (nodes[other].get("deps") or [])):
+                charge(other)
     total = sum(m for i, m in minutes.items() if by_id(data)[i].get("status") not in FINISHED_STATUSES)
     return clock, peak, total
 
@@ -941,10 +1043,14 @@ def check_integrable(data: dict, graph_path: Path, nid: str, root: Path, wt: Pat
     node = by_id(data)[nid]
     if not wt.is_dir():
         raise SystemExit(f"refused: the lane worktree {wt} does not exist")
+    unlanded = [d for d in node.get("deps") or [] if by_id(data).get(d, {}).get("status") not in FINISHED_STATUSES]
+    if unlanded:
+        raise SystemExit(f"refused: {nid} lands after its dependencies, and {', '.join(unlanded)} "
+                         f"{'has' if len(unlanded) == 1 else 'have'} not landed. Land again after they do.")
     if rebase_in_progress(wt):
         raise SystemExit(
-            f"refused: a rebase is in progress in {wt}. Resolve the conflict and run "
-            f"`git -C {wt} rebase --continue`, or run `git -C {wt} rebase --abort`; then integrate again")
+            f"refused: a rebase stopped at a conflict in {wt}. Set the task `conflicted` and run the resolve "
+            f"stage, which continues the rebase; then land again")
     on = _git("-C", str(wt), "symbolic-ref", "--short", "HEAD")
     if on != branch:
         raise SystemExit(f"refused: the lane worktree is on {on or 'a detached HEAD'}, not {branch}")
@@ -970,6 +1076,10 @@ def check_integrable(data: dict, graph_path: Path, nid: str, root: Path, wt: Pat
     if missing:
         raise SystemExit("refused: the workflow isn't finished; these reports are missing (run the stage):\n"
                          + "\n".join(missing))
+    after_resolve = resolve_followups(node, plan, scratch)
+    if after_resolve:
+        raise SystemExit("refused: the resolve stage ran, and these prompts must run after it: "
+                         + ", ".join(after_resolve))
     undecided = undecided_owner_items(node, plan, scratch)
     if undecided:
         who = ("the owner's answers" if int(plan.get("autonomy", 2)) < 4
@@ -986,6 +1096,42 @@ def check_integrable(data: dict, graph_path: Path, nid: str, root: Path, wt: Pat
     current = _git("-C", str(root), "symbolic-ref", "--short", "HEAD")
     if current != main:
         raise SystemExit(f"refused: the main worktree {root} is on {current or 'a detached HEAD'}, not {main}")
+
+
+def rebase_conflicts(root: Path, main: str, branch: str) -> list[str]:
+    """The files that rebasing `branch` onto `main` would conflict in; empty if it merges cleanly.
+
+    `git merge-tree --write-tree` merges in memory: it changes no worktree, index, or ref. It compares
+    the branch tips, so an intermediate commit of the rebase can still conflict in rare cases; that
+    rebase stops in progress, and the resolve stage continues it.
+    """
+    out = subprocess.run(["git", "-C", str(root), "merge-tree", "--write-tree", "--name-only", main, branch],
+                         capture_output=True, text=True, check=False)
+    if out.returncode != 1:
+        return []
+    names = []
+    for line in out.stdout.splitlines()[1:]:
+        if not line.strip():
+            break
+        names.append(line.strip())
+    return sorted(set(names)) or ["(unknown files)"]
+
+
+def resolve_followups(node: dict, plan: dict, scratch: Path) -> list[str]:
+    """The prompts that must finish after the task's last resolve stage and haven't."""
+    runs = {r["name"]: r for r in stage_runs(node, scratch)}
+    resolve = runs.get("resolve")
+    if resolve is None:
+        return []
+    if resolve["end"] is None:
+        return ["resolve"]
+    if report_section(report_file(scratch, node["id"], "resolve"), "Escalate"):
+        # The change is larger than the conflicted hunks: the fix stage, then the task's normal review.
+        needed = ["fix"] + part_names(last_review(workflow_of(node, plan)) or "review")
+    else:
+        needed = part_names("resolution_review")
+    return [name for name in needed
+            if not (name in runs and runs[name]["end"] is not None and runs[name]["start"] >= resolve["start"])]
 
 
 def _chain(lines: list[str], steps: list[str]) -> list[str]:
@@ -1053,6 +1199,12 @@ def lane_commands(data: dict, graph_path: Path, nid: str, action: str) -> str:
                 steps += close_steps() + record_steps()
             return "\n".join(_chain(lines, steps))
         check_integrable(data, graph_path, nid, root, wt, branch, main)
+        conflicts = rebase_conflicts(root, main, branch)
+        if conflicts:
+            lines += [f"# rebasing {branch} onto {main} would conflict in: {', '.join(conflicts)}.",
+                      "# The command marks the lane `conflicted` and starts no rebase. Run the resolve stage next."]
+            note = q(f"log=landing would conflict in {', '.join(conflicts)}; run the resolve stage")
+            return "\n".join(_chain(lines, [f"{me} set {graph} {q(nid)} status=conflicted {note}"]))
         changed = (_git("-C", str(root), "diff", "--name-only", f"{main}...{branch}") or "").splitlines()
         unlisted = sorted(set(changed) - set(n.get("files") or []))
         if unlisted:
@@ -1157,8 +1309,10 @@ def task_reports(node: dict, plan: dict, scratch: Path) -> list[Path]:
     names = [name for stage in workflow_of(node, plan) for name in part_names(stage)]
     if "fix" not in names:
         names.append("fix")
+    names += ["resolve"] + part_names("resolution_review")
     ordered = [n for n in ("implement", "review-report", "review-fix", "second_review-report",
-                           "second_review-fix", "fix", "delegate") if n in names]
+                           "second_review-fix", "fix", "delegate", "resolve", "resolution_review-report",
+                           "resolution_review-fix") if n in names]
     return [report_file(scratch, node["id"], n) for n in ordered] + [decisions_file(scratch, node["id"])]
 
 
@@ -1175,7 +1329,7 @@ def undecided_owner_items(node: dict, plan: dict, scratch: Path) -> list[str]:
     return [source for source, _ in found["Needs owner"]]
 
 
-FINDING_SECTIONS = ("Needs owner", "Owner-level decisions taken", "Beyond", "Residuals")
+FINDING_SECTIONS = ("Needs owner", "Owner-level decisions taken", "Beyond", "Residuals", "Escalate")
 
 
 def findings(node: dict, plan: dict, scratch: Path) -> dict[str, list[tuple[str, str]]]:
@@ -1283,7 +1437,8 @@ def build_context(data: dict, graph_path: Path, nid: str, note: str | None) -> P
 
 TEMPLATE_RE = re.compile(r"^```template:([\w-]+)\n(.*?)^```", re.M | re.S)
 TEMPLATE_NAMES = {"header", "implement", "implement-measurement", "review-report", "review-fix",
-                  "second_review-report", "second_review-fix", "fix", "delegate"}
+                  "second_review-report", "second_review-fix", "fix", "delegate", "resolve",
+                  "resolution_review-report", "resolution_review-fix"}
 
 
 def templates() -> dict[str, str]:
@@ -1322,7 +1477,9 @@ def render_prompt(data: dict, graph_path: Path, nid: str, stage: str, part: str 
         # The fix stage also runs outside the workflow, to apply the owner's answers or reopen a lane.
         if decisions is None and not (autonomy >= 4 and decider(plan, stages) == "fix"):
             raise SystemExit("refused: the fix stage needs --decisions FILE (accepted findings, owner answers, "
-                             "or the gate failure)")
+                             "the gate failure, or the resolve stage's escalation)")
+    elif stage in ("resolve", "resolution_review"):
+        pass  # they run when a landing conflicts, whatever the workflow
     elif stage not in stages:
         raise SystemExit(f"refused: {nid}'s workflow is {' -> '.join(stages) or 'none'}; it has no {stage} stage")
     name = prompt_name(stage, part)
@@ -1336,8 +1493,40 @@ def render_prompt(data: dict, graph_path: Path, nid: str, stage: str, part: str 
     tmp = stage_tmp(scratch, name)
     tmp.mkdir(parents=True, exist_ok=True)
     context = scratch / f"{nid}_context.md"
-    if stage in ("second_review", "delegate") and not context.exists():
+    if stage in ("second_review", "delegate", "resolve") and not context.exists():
         context = build_context(data, graph_path, nid, None)
+    base_file = scratch / f"{nid}_resolve-base.txt"
+    old_base = old_tip = resolve_reason = ""
+    if stage == "resolve":
+        # Record where the lane stood, so the resolution review can see exactly what resolving changed.
+        wt = Path(str(n.get("lane") or root_dir(plan, "worktree_root", graph_path) / nid))
+        main = str(plan["integration_branch"])
+        mid_rebase = rebase_in_progress(wt)
+        if mid_rebase:  # the lane's commits before the rebase started
+            orig = _git("-C", str(wt), "rev-parse", "--git-path", "rebase-merge/orig-head") or ""
+            orig_file = wt / orig
+            old_tip = orig_file.read_text().strip() if orig and orig_file.exists() else ""
+        else:
+            old_tip = _git("-C", str(wt), "rev-parse", "HEAD") or ""
+        old_base = _git("-C", str(wt), "merge-base", old_tip or "HEAD", main) or ""
+        if not old_tip:
+            raise SystemExit(f"refused: can't read the lane's HEAD in {wt}")
+        base_file.write_text(f"{old_base} {old_tip}\n", encoding="utf-8")
+    elif stage == "resolution_review":
+        if not base_file.exists():
+            raise SystemExit("refused: run the resolve stage first; the resolution review reviews its work")
+        old_base, old_tip = base_file.read_text(encoding="utf-8").split()
+    if stage == "resolve":
+        main_tip = _git("-C", str(repo_root(graph_path)), "rev-parse", str(plan["integration_branch"])) or ""
+        if mid_rebase:
+            resolve_reason = ("A rebase onto the integration branch stopped at a conflict and is still in "
+                              "progress: work that landed after this lane opened changed the same lines.")
+        elif old_base and old_base == main_tip:
+            resolve_reason = ("The lane is already rebased onto the integration branch, and a gate failed after "
+                              "the rebase: work that landed after this lane opened changed something this lane uses.")
+        else:
+            resolve_reason = ("Rebasing the lane onto the integration branch conflicts: work that landed after "
+                              "this lane opened changed the same lines.")
     is_last_review = stage == last_review(stages)
     writes_landed = (name in ("fix", "delegate") or (part == "fix" and is_last_review)
                      or (stage == "implement" and n.get("kind") == "measurement"))
@@ -1389,6 +1578,9 @@ def render_prompt(data: dict, graph_path: Path, nid: str, stage: str, part: str 
         "mutation_duty": mutation,
         "landed_duty": landed_duty,
         "context": str(context),
+        "old_base": old_base,
+        "old_tip": old_tip,
+        "resolve_reason": resolve_reason,
         "spec": spec,
         "decisions": decision_text,
     }
@@ -1415,6 +1607,90 @@ def render_prompt(data: dict, graph_path: Path, nid: str, stage: str, part: str 
         launcher = (f"You are the {name} stage of task {nid}. Your complete instructions are in {out}. Read that "
                     f"file first and follow it exactly; it is your whole task.")
     return out, launcher
+
+
+# ── settings: preview and configure ───────────────────────────────────────────
+
+def parse_settings(assignments: list[str]) -> dict:
+    out: dict = {}
+    for a in assignments:
+        key, sep, value = a.partition("=")
+        if not sep or key not in SETTINGS:
+            raise SystemExit(f"expected key=value with a key from {SETTINGS}, got {a!r}")
+        if key == "file_overlap":
+            out[key] = "off" if value in ("off", "0") else int(value)
+        elif key == "lane_cap":
+            out[key] = int(value)
+        else:
+            out[key] = value
+    return out
+
+
+def in_flight(data: dict, graph_path: Path) -> list[str]:
+    """Prompts that started and have no report yet: stages still running."""
+    plan = data["plan"]
+    out = []
+    for nid, n in by_id(data).items():
+        if n.get("status") in OPEN_STATUSES:
+            out += [f"{nid}:{r['name']}" for r in stage_runs(n, lane_scratch(plan, graph_path, nid)) if r["end"] is None]
+    return out
+
+
+def describe_settings(data: dict, graph_path: Path, records: list[dict]) -> list[str]:
+    plan = data["plan"]
+    makespan, peak, _ = simulate(data, records)
+    start, _, _ = next_ready(data, lane_changes(data, graph_path))
+    todo = [n for n in by_id(data).values() if n.get("status") not in FINISHED_STATUSES]
+    flows = sorted({" -> ".join(workflow_of(n, plan)) for n in todo if n.get("status") == "planned"})
+    return [
+        f"  settings: file_overlap {file_overlap_of(plan) or 'off'}, dependency_overlap "
+        f"{dependency_overlap_of(plan)}, lane_cap {plan.get('lane_cap')}, coordinator {plan.get('coordinator', 'full')}",
+        f"  estimated time for the unfinished tasks: {makespan:.0f} min, at most {peak} lane(s) at once",
+        f"  would start now: {', '.join(n['id'] for n in start) or 'nothing'}",
+        f"  workflows of tasks not yet started: {'; '.join(flows) or 'none'}",
+        "  a landing that conflicts: " + ("the lane runs resolve, then a resolution review" if overlap_enabled(plan)
+                                          else "rare (only unlisted files); the lane runs resolve, then a resolution review"),
+    ]
+
+
+def preview(data: dict, graph_path: Path, change: dict) -> str:
+    records = load_timings(graph_path, data["plan"])
+    proposed = {**data, "plan": {**data["plan"], **change}}
+    errors, _ = validate(proposed, graph_path)
+    lines = ["current:"] + describe_settings(data, graph_path, records)
+    lines += ["proposed:"] + describe_settings(proposed, graph_path, records)
+    open_lanes = [i for i, n in by_id(data).items() if n.get("status") in OPEN_STATUSES]
+    if open_lanes:
+        lines.append(f"open lanes ({', '.join(open_lanes)}) keep running; the change applies to lanes opened after "
+                     f"it, and every landing still waits for its dependencies")
+    busy = in_flight(data, graph_path)
+    if busy:
+        lines.append(f"stages in flight: {', '.join(busy)}. `configure` refuses until they return: stop launching "
+                     f"stages and wait for them (the barrier)")
+    lines += [f"error in the proposed settings: {e}" for e in errors]
+    return "\n".join(lines)
+
+
+def configure(graph_path: Path, change: dict) -> str:
+    with locked(graph_path):
+        data = load(graph_path)
+        busy = in_flight(data, graph_path)
+        if busy:
+            raise SystemExit(f"refused: stages are in flight ({', '.join(busy)}). Stop launching stages, wait for "
+                             f"these to return, then configure again.")
+        plan = data["plan"]
+        before = {k: plan.get(k) for k in change}
+        for k, v in change.items():
+            plan[k] = v
+        errors, _ = validate(data, graph_path)
+        if errors:
+            raise SystemExit("refused: the change leaves errors in the plan:\n" + "\n".join(errors))
+        if plan.get("changes") is None:
+            plan["changes"] = []
+        for k, v in change.items():
+            plan["changes"].append(f"{now()} {k}: {before[k]} -> {v}")
+        save(graph_path, data)
+    return "locked in: " + ", ".join(f"{k}={v}" for k, v in change.items())
 
 
 # ── final report and cleanup ───────────────────────────────────────────────────
@@ -1534,6 +1810,10 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("clean")
     p.add_argument("graph", type=Path)
     p.add_argument("id", nargs="?")
+    for name in ("preview", "configure"):
+        p = sub.add_parser(name)
+        p.add_argument("graph", type=Path)
+        p.add_argument("settings", nargs="+")
     args = parser.parse_args(argv)
 
     graph_path: Path = args.graph.resolve()
@@ -1541,6 +1821,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no such file: {graph_path}", file=sys.stderr)
         return 2
 
+    if args.cmd == "configure":
+        print(configure(graph_path, parse_settings(args.settings)))
+        return 0
     if args.cmd == "set":
         with locked(graph_path):
             data = load(graph_path)
@@ -1607,6 +1890,22 @@ def main(argv: list[str] | None = None) -> int:
             print("file conflicts between tasks that no dependency orders: "
                   + "; ".join(f"{a} x {b} ({', '.join(files)})" for a, b, files in conflicts)
                   + (f"; they cost {makespan - no_files:.0f} min" if makespan - no_files >= 1 else ""))
+        options = []
+        for value in (0, DEFAULT_FILE_OVERLAP, file_overlap_of(plan)):
+            options.append(("file_overlap", value or "off", simulate(data, records, settings={"file_overlap": value})[0],
+                            value == file_overlap_of(plan)))
+        for value in DEPENDENCY_OVERLAP:
+            options.append(("dependency_overlap", value,
+                            simulate(data, records, settings={"dependency_overlap": value})[0],
+                            value == dependency_overlap_of(plan)))
+        print("overlap options (estimated minutes; * marks the current setting; each row holds the other setting):")
+        seen = set()
+        for key, value, minutes, current in options:
+            if (key, value) not in seen:
+                seen.add((key, value))
+                print(f"  {key} {value}: {minutes:.0f}{' *' if current else ''}")
+        if not any(n.get("interface_deps") for n in todo):
+            print("  (dependency_overlap interfaces changes nothing until tasks list interface_deps)")
         if len(todo) >= 3 and peak <= 1:
             if by_deps <= 1:
                 print("warning: the plan runs one lane at a time because the dependencies form a chain: each task "
@@ -1699,6 +1998,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "clean":
         print(clean(data, graph_path, args.id))
+        return 0
+    if args.cmd == "preview":
+        print(preview(data, graph_path, parse_settings(args.settings)))
         return 0
     if args.cmd == "excerpt":
         n = by_id(data)[args.id]

@@ -14,6 +14,7 @@ themselves are rendered by `plan.py prompt`; you never write one.
 - Running a stage
 - Mutation testing
 - Scratch space and cleanup
+- Resolving a conflicted landing
 - Reopening a lane
 - Running a workflow with or without a workflow tool
 
@@ -47,6 +48,9 @@ workflow, however important it feels.
 In the `delegate` coordinator mode, every workflow ends with a `delegate`
 stage (see "Owner-level decisions" and `references/coordinator.md`).
 
+Two stages run only when a landing conflicts, whatever the workflow:
+`resolve`, then `resolution_review`. See "Resolving a conflicted landing".
+
 ## The stages
 
 | Stage | Prompts | Job | Commits | Writes "As landed" |
@@ -56,6 +60,8 @@ stage (see "Owner-level decisions" and `references/coordinator.md`).
 | second_review | 2: report, then fix | Checks the first review's work, removes scope creep, and makes the change simple, clear, and a good fit for the existing code and the upcoming tasks. It may refactor. | `<id>: second review proofs`, `<id>: second review fixes` | yes |
 | fix | 1 | Applies the decisions made after the reviews: accepted `beyond` items and the owner's answers. At autonomy 4 it makes the owner-level calls itself. | `<id>: fix` | yes |
 | delegate | 1 | Does the coordinator's review, decisions, and fixes for this task, from a brief. | `<id>: coordinator review` | yes |
+| resolve | 1 | Rebases a `conflicted` lane onto the integration branch and keeps both sides; adapts the lane to landed interface changes. The only stage allowed to rebase. | the rebased commits, `<id>: resolve` | no |
+| resolution_review | 2: report, then fix | Checks only the resolve stage's work: both sides kept, nothing unrelated changed, all tests present. Doesn't judge the implementation or its reviews. | `<id>: resolution fixes` | no |
 
 A review is one agent given two prompts. It reports every problem and
 commits the proofs before it is told to fix anything, so a finding can't
@@ -155,6 +161,34 @@ Cleanup is best effort, by `plan.py clean`:
 - After the final report is written, `plan.py clean graph.yaml` removes the
   whole scratch root, except the patches of abandoned tasks.
 - Removing a worktree removes its build directory.
+
+## Resolving a conflicted landing
+
+With `file_overlap` greater than 1 or `dependency_overlap` on, lanes run
+together and the later ones conflict when they land. Before a landing
+rebases, `lane land` checks with `git merge-tree` whether the rebase would
+conflict. If it would, the printed command only sets the task to
+`conflicted`, and no rebase starts. In the rare case that a rebase still
+stops at a conflict, it stays in progress and the resolve stage continues it.
+A gate that fails after a clean rebase, because landed work changed
+something this lane uses, takes the same path.
+
+1. `plan.py prompt graph.yaml <id> resolve` records where the lane stands
+   and renders the resolve prompt. The resolve stage rebases, resolves each
+   conflict so that both changes survive, adapts the lane to landed
+   interface changes, runs the gates, and commits.
+2. If every change stays in the conflicted hunks, or in the lines that use
+   what the landed work changed, run the resolution review: `--part
+   report`, then `--part fix` to the same agent. It sees exactly what
+   resolving changed (a `git range-diff` of the lane before and after), and
+   nothing else. Use a mid-tier model; it is shorter than a normal review.
+3. If the fix needs more (new behavior, a redesign), the resolve stage makes
+   the smallest resolution that lets the rebase finish, writes an "Escalate"
+   section, and starts its final message with `ESCALATE:`. Run the fix
+   stage with that section as its decisions, then the task's last review
+   stage again, both parts.
+4. Land again. Landing refuses until the prompts that step 2 or step 3
+   requires have run after the resolve stage.
 
 ## Reopening a lane
 

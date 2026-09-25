@@ -285,3 +285,92 @@ Report: your decision on each "Beyond" item; each change (file, line) and
 why; each gate result; "Residuals".
 {{landed_duty}}
 ```
+
+```template:resolve
+{{common header}}
+
+STAGE: RESOLVE.
+
+This task's workflow is finished, but it can't land yet. {{resolve_reason}}
+Your job is to bring the lane up to date with the integration branch while
+keeping both sides: this task's change and the work that landed. You are the
+only stage allowed to rebase; rule 2's ban on rebasing doesn't apply to you,
+and the bans on stash, reset, and checkout still do.
+
+Read the coordinator's brief first, {{context}}: it lists the tasks that
+landed and what each one changed. The lane stood at {{old_tip}}, on top of
+{{old_base}}. `git -C {{lane_worktree}} log --oneline {{old_base}}..{{integration_branch}}`
+lists the commits that landed since this lane opened.
+
+1. If a rebase is in progress, continue it. If the lane isn't rebased yet,
+   run `git -C {{lane_worktree}} rebase {{integration_branch}}`. Resolve each
+   conflict so that both changes survive: keep this task's behavior and the
+   landed task's behavior. Stage each resolved file and continue the rebase
+   until it finishes. Don't cancel the rebase.
+2. Run every gate, one at a time. If a gate fails because landed work
+   changed something this lane uses (a renamed function, a new argument, a
+   changed output format), adapt this lane's code in the lines that use it.
+3. Stay within scope. Resolve only when every change you make is inside
+   the conflicted hunks, or in the lines that use what the landed work
+   changed, and no behavior of either task changes. If the fix needs more
+   than that (a redesign, new behavior, changes across the task), make the
+   smallest resolution that lets the rebase finish, commit it, and write a
+   section under the heading "Escalate" that says what differs and why it
+   needs a real fix. Start your final message with "ESCALATE:".
+4. Commit any edits after the rebase with the message
+   "{{task_id}}: resolve". End with
+   `git -C {{lane_worktree}} status --porcelain` printing nothing.
+
+Report: each conflicted file and hunk, and how you resolved it (which side
+you kept, or how you merged them); each adaptation to landed work (file,
+line); each gate result with the test counts; "Escalate" if you escalate.
+```
+
+```template:resolution_review-report
+{{common header}}
+
+STAGE: RESOLUTION REVIEW, PART 1 OF 2: REPORT THE PROBLEMS.
+
+A resolve stage brought this lane up to date with the integration branch.
+Review only its work: the conflict resolutions and the adaptations to landed
+work. Don't judge the task's implementation or its earlier reviews; they are
+settled.
+
+Read the resolve report, {{scratch}}/{{task_id}}_resolve.md. See exactly what
+resolving changed with
+`git -C {{lane_worktree}} range-diff {{old_base}}..{{old_tip}} $(git -C {{lane_worktree}} merge-base HEAD {{integration_branch}})..HEAD`:
+it compares the lane's commits before and after the rebase, including any
+"{{task_id}}: resolve" commit.
+
+Check, for each resolved hunk and each adaptation:
+1. Both sides survive: nothing of this task's change and nothing of the
+   landed change was dropped or altered.
+2. Nothing unrelated changed.
+3. The tests of this task and of the landed tasks are all still present,
+   and every gate passes.
+
+Change no product code in this part. Label each problem `resolution`, give
+the evidence (a failing test, or the hunk and what it lost), and the fix you
+intend. Commit any proof tests (prefix `review_proof_`, skipped or
+expected-to-fail) with the message "{{task_id}}: resolution review proofs".
+
+Report, with the heading "Findings" (numbered). Keep it short: this review
+covers only the resolution. Then stop: your instructions for part 2 follow.
+```
+
+```template:resolution_review-fix
+{{common header}}
+
+STAGE: RESOLUTION REVIEW, PART 2 OF 2: FIX.
+
+Fix the findings in your report,
+{{scratch}}/{{task_id}}_resolution_review-report.md, and change nothing
+else. Turn each `review_proof_` test into a real test with a real name, or
+remove it and say why; `grep -rn review_proof_` must find nothing. Run every
+gate, one at a time. Commit on {{lane_branch}} with the message
+"{{task_id}}: resolution fixes" if anything changed. End with
+`git -C {{lane_worktree}} status --porcelain` printing nothing.
+
+Report: each fix (file, line) and the test that pins it; each gate result
+with the test counts.
+```
