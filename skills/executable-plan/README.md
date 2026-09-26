@@ -58,6 +58,7 @@ request outside a plan (use a review skill for that).
 | `assets/graph-template.yaml` | A commented skeleton of `graph.yaml`. |
 | `assets/plan-template.md` | A plan document skeleton in Markdown, with the `<!-- task: id -->` marker convention. |
 | `assets/plan-template.html` | The same skeleton as a self-contained HTML page, with `id` anchors on the task headings. |
+| `benchmark/` | The cells benchmark: a ten-task backlog that five arms (two without the skill, three with it at different settings) implement in parallel under a 30-minute cap, scored by 120 hidden tests. `benchmark/README.md` explains how to run it. Agents never read it. The runner leaves it, and this README, out of the copy of the skill that the arms get. |
 
 ## Design notes
 
