@@ -384,6 +384,46 @@ def test_waves_names_shared_files_as_the_cause(tmp_path, capsys):
     assert "file_overlap off: 32 *" in out and "file_overlap 2: " in out and "dependency_overlap all:" in out
 
 
+def test_shared_files_never_hold_a_lane_back():
+    nodes = [n("a", files=["a.py", "README.md"]), n("b", files=["b.py", "README.md"]),
+             n("c", files=["c.py", "README.md"])]
+    data = {"plan": {"lane_cap": 3, "autonomy": 2, "file_overlap": "off"}, "nodes": nodes}
+    start, hold, _ = plan.next_ready(data)
+    assert [s["id"] for s in start] == ["a"] and "shares files with an open lane: README.md" in hold[0][1]
+    data["plan"]["shared_files"] = ["README.md"]
+    start, hold, _ = plan.next_ready(data)
+    assert [s["id"] for s in start] == ["a", "b", "c"] and not hold
+    # A lane that has changed a shared file doesn't hold others back either.
+    nodes[0]["status"] = "running"
+    start, _, _ = plan.next_ready(data, {"a": {"README.md"}})
+    assert [s["id"] for s in start] == ["b", "c"]
+    # The landings still conflict in README.md, so the simulation charges the resolve stages.
+    nodes[0]["status"] = "planned"
+    makespan, peak, _ = plan.simulate(data, [])
+    assert peak == 3 and makespan == pytest.approx(6.5 + 4.0)
+    assert plan.overlap_enabled({"file_overlap": "off", "shared_files": ["README.md"]})
+    assert plan.parse_settings(["shared_files=README.md, CHANGELOG.md"]) == {"shared_files": ["README.md", "CHANGELOG.md"]}
+    assert plan.parse_settings(["shared_files="]) == {"shared_files": []}
+
+
+def test_waves_suggests_shared_files(tmp_path, capsys):
+    out = waves_out(tmp_path, capsys, [
+        task("a", "#a", files=["a.py", "README.md"]),
+        task("b", "#b", files=["b.py", "README.md"]),
+        task("c", "#residuals", files=["c.py", "README.md"]),
+    ], file_overlap="off")
+    assert "shared files: README.md (3 of 3 tasks). If the tasks only add to them" in out
+    assert "Estimated with shared_files README.md: 17 min" in out  # lane_cap 2; each later landing resolves
+    (tmp_path / "shared").mkdir()
+    out = waves_out(tmp_path / "shared", capsys, [
+        task("a", "#a", files=["a.py", "README.md"]),
+        task("b", "#b", files=["b.py", "README.md"]),
+        task("c", "#residuals", files=["c.py", "README.md"]),
+    ], file_overlap="off", shared_files=["README.md"])
+    assert "shared files:" not in out and "exclusions (never at the same time)" not in out
+    assert "at most 2 lane(s) at once" in out  # lane_cap 2 in the test repository
+
+
 def test_waves_names_a_dependency_chain_as_the_cause(tmp_path, capsys):
     out = waves_out(tmp_path, capsys, [
         task("a", "#a", files=["a.py"]),
@@ -858,17 +898,21 @@ def test_preview_and_configure_change_settings_behind_a_barrier(tmp_path, capsys
     assert "would start now: a" in out
     open_lane(graph_path)  # renders the implement prompt: a stage in flight
     with pytest.raises(SystemExit, match="stages are in flight \\(a:implement\\)"):
-        plan.configure(graph_path, {"file_overlap": "off"})
+        plan.configure(graph_path, {"file_overlap": "off"}, "turn overlap off")
     plan.report_file(scratch_of(graph_path, "a"), "a", "implement").write_text("done")
-    assert plan.configure(graph_path, {"file_overlap": "off"}) == "locked in: file_overlap=off"
+    with pytest.raises(SystemExit, match="--quote must hold the user's own words"):
+        plan.configure(graph_path, {"file_overlap": "off"}, " ")
+    assert plan.main(["configure", str(graph_path), "file_overlap=off", "--quote", "turn overlap off"]) == 0
+    assert "locked in: file_overlap=off" in capsys.readouterr().out
     p = plan.load(graph_path)["plan"]
     assert p["file_overlap"] == "off"
-    assert p["changes"][-1].endswith("file_overlap: None -> off")  # the key was absent, so the default applied
+    # the key was absent, so the default applied; the user's words are recorded with the change
+    assert p["changes"][-1].endswith("file_overlap: None -> off (the user: 'turn overlap off')")
     data = plan.load(graph_path)
     del data["plan"]["models"]["resolve"]
     plan.save(graph_path, data)
     with pytest.raises(SystemExit, match="plan.models.resolve is missing"):
-        plan.configure(graph_path, {"file_overlap": 3})
+        plan.configure(graph_path, {"file_overlap": 3}, "allow three lanes a file")
 
 
 def test_lanes_open_only_after_the_user_approves(tmp_path):
@@ -890,10 +934,11 @@ def test_lanes_open_only_after_the_user_approves(tmp_path):
 
 
 def test_validate_checks_the_overlap_settings(tmp_path):
-    graph_path = make_repo(tmp_path, file_overlap="sometimes", dependency_overlap="maybe")
+    graph_path = make_repo(tmp_path, file_overlap="sometimes", dependency_overlap="maybe", shared_files="README.md")
     data = plan.load(graph_path)
     data["nodes"][1]["interface_deps"] = ["z"]
     errors, _ = plan.validate(data, graph_path)
+    assert any("plan.shared_files must be a list of file paths" in e for e in errors)
     assert any("plan.file_overlap must be `off` or an integer" in e for e in errors)
     assert any("plan.dependency_overlap must be one of" in e for e in errors)
     assert "b: interface_deps lists 'z', which is not in deps" in errors

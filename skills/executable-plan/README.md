@@ -101,6 +101,15 @@ safety hooks commonly block that command. Changing a setting mid-run goes
 through `plan.py preview` and `plan.py configure`, which refuses while any
 stage is in flight.
 
+**Why shared files, and why `configure` needs the user's words.** In the
+first cells benchmark run, the draft listed `README.md` in all ten tasks, as
+the backlog asked, so `file_overlap: 2` let only two lanes run at a time and
+`waves` estimated 52 minutes. `shared_files` exempts files that most tasks
+only add to; their conflicts still go through the resolve stage. In the same
+run, a coordinator at autonomy 4 raised `file_overlap` to 10 on its own.
+The rule that only the user changes a setting was prose, so `configure` now
+requires the user's words, as `approve` does.
+
 **Why three coordinator modes.** The coordinator was 30% of the cost of the
 second behavioral test, and every lane waited on it. `merge` and `delegate`
 move the review out of its context; owner-level questions still go to the

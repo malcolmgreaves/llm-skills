@@ -22,7 +22,7 @@ Usage:
     uv run plan.py report GRAPH                # write the final report next to graph.yaml
     uv run plan.py clean GRAPH [ID]            # reclaim scratch space (a lane's, or the campaign's)
     uv run plan.py preview GRAPH key=value ... # compare a settings change with the current settings
-    uv run plan.py configure GRAPH key=value ...   # lock in a settings change (refused while a stage runs)
+    uv run plan.py configure GRAPH key=value ... --quote TEXT   # lock in the user's change (refused while a stage runs)
     uv run plan.py approve GRAPH --autonomy N --quote TEXT   # record the user's approval to start
 
 The script runs only read-only git commands. It prints every command that
@@ -78,7 +78,7 @@ COORDINATOR_MODES = ("full", "merge", "delegate")
 DEPENDENCY_OVERLAP = ("off", "interfaces", "all")
 DEFAULT_FILE_OVERLAP = 2
 # Settings that `preview` compares and `configure` changes; each changes the schedule or the workflows.
-SETTINGS = ("file_overlap", "dependency_overlap", "lane_cap", "coordinator", "autonomy")
+SETTINGS = ("file_overlap", "dependency_overlap", "shared_files", "lane_cap", "coordinator", "autonomy")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 ESCALATIONS = ("untrusted-input", "persistence", "security", "concurrency", "breaking-interface")
 # Model-neutral minutes of agent time per stage for an S task, until measured timings exist.
@@ -202,9 +202,20 @@ def dependency_overlap_of(plan: dict) -> str:
     return "off" if value is False else str(value)
 
 
+def shared_files_of(plan: dict) -> set[str]:
+    """Files that any number of open lanes can list or change, whatever `file_overlap` is."""
+    value = plan.get("shared_files") or []
+    return {str(f) for f in value} if isinstance(value, list) else set()
+
+
+def scheduled_files(node: dict, plan: dict) -> set[str]:
+    """The files that keep lanes apart: the task's `files`, less the shared files."""
+    return set(node.get("files") or []) - shared_files_of(plan)
+
+
 def overlap_enabled(plan: dict) -> bool:
     """True if lanes can conflict at landing because of overlap, so the resolve stages must be configured."""
-    return file_overlap_of(plan) >= 2 or dependency_overlap_of(plan) != "off"
+    return file_overlap_of(plan) >= 2 or dependency_overlap_of(plan) != "off" or bool(shared_files_of(plan))
 
 
 def last_review(stages: list[str]) -> str | None:
@@ -488,6 +499,9 @@ def validate(data: dict, graph_path: Path) -> tuple[list[str], list[str]]:
         errors.append("plan.file_overlap must be `off` or an integer >= 0: the most open lanes that may share one file")
     if dependency_overlap_of(plan) not in DEPENDENCY_OVERLAP:
         errors.append(f"plan.dependency_overlap must be one of {DEPENDENCY_OVERLAP}")
+    shared = plan.get("shared_files")
+    if shared is not None and not (isinstance(shared, list) and all(isinstance(f, str) and f for f in shared)):
+        errors.append("plan.shared_files must be a list of file paths: files that tasks may all change at once")
     if plan.get("approved") is not None and not isinstance(plan.get("approved"), str):
         errors.append("plan.approved must be a string (plan.py approve writes it)")
     if plan.get("changes") is not None and not isinstance(plan.get("changes"), list):
@@ -811,11 +825,12 @@ def _next_ready(data: dict, changed: dict[str, set[str]] | None,
     start: list[dict] = []
     limit = max(1, file_overlap_of(plan))
     users: Counter = Counter()  # file -> open lanes that list it or have changed it
+    shared = shared_files_of(plan)
     for r in running:
-        for f in set(r.get("files") or []) | (changed or {}).get(r["id"], set()):
+        for f in (scheduled_files(r, plan) | (changed or {}).get(r["id"], set())) - shared:
             users[f] += 1
     for n in eligible:
-        crowded = sorted(f for f in set(n.get("files") or []) if users[f] >= limit)
+        crowded = sorted(f for f in scheduled_files(n, plan) if users[f] >= limit)
         if crowded:
             if limit == 1:
                 reason = "shares files with an open lane: " + ", ".join(crowded[:3]) + (" ..." if len(crowded) > 3 else "")
@@ -833,7 +848,7 @@ def _next_ready(data: dict, changed: dict[str, set[str]] | None,
             hold.append((n["id"], "no free lane slot"))
             continue
         start.append(n)
-        for f in set(n.get("files") or []):
+        for f in scheduled_files(n, plan):
             users[f] += 1
     return start, hold, slots
 
@@ -921,11 +936,12 @@ def file_conflicts(data: dict) -> list[tuple[str, str, list[str]]]:
     """Unfinished task pairs that share files and that no dependency orders: the shared files keep them apart."""
     todo = [n for n in by_id(data).values() if n.get("status") not in FINISHED_STATUSES]
     before = ancestors(data)
+    plan = data["plan"]
     out = []
     for x in range(len(todo)):
         for y in range(x + 1, len(todo)):
             a, b = todo[x], todo[y]
-            shared = sorted(set(a.get("files") or []) & set(b.get("files") or []))
+            shared = sorted(scheduled_files(a, plan) & scheduled_files(b, plan))
             if shared and a["id"] not in before[b["id"]] and b["id"] not in before[a["id"]]:
                 out.append((a["id"], b["id"], shared))
     return out
@@ -1627,6 +1643,8 @@ def parse_settings(assignments: list[str]) -> dict:
             raise SystemExit(f"expected key=value with a key from {SETTINGS}, got {a!r}")
         if key == "file_overlap":
             out[key] = "off" if value in ("off", "0") else int(value)
+        elif key == "shared_files":
+            out[key] = [f.strip() for f in value.split(",") if f.strip()]
         elif key in ("lane_cap", "autonomy"):
             out[key] = int(value)
         else:
@@ -1652,8 +1670,8 @@ def describe_settings(data: dict, graph_path: Path, records: list[dict]) -> list
     flows = sorted({" -> ".join(workflow_of(n, plan)) for n in todo if n.get("status") == "planned"})
     return [
         f"  settings: file_overlap {file_overlap_of(plan) or 'off'}, dependency_overlap "
-        f"{dependency_overlap_of(plan)}, lane_cap {plan.get('lane_cap')}, coordinator {plan.get('coordinator', 'full')}, "
-        f"autonomy {plan.get('autonomy')}",
+        f"{dependency_overlap_of(plan)}, shared_files {', '.join(sorted(shared_files_of(plan))) or 'none'}, "
+        f"lane_cap {plan.get('lane_cap')}, coordinator {plan.get('coordinator', 'full')}, autonomy {plan.get('autonomy')}",
         f"  estimated time for the unfinished tasks: {makespan:.0f} min, at most {peak} lane(s) at once",
         f"  would start now: {', '.join(n['id'] for n in start) or 'nothing'}",
         f"  workflows of tasks not yet started: {'; '.join(flows) or 'none'}",
@@ -1680,7 +1698,11 @@ def preview(data: dict, graph_path: Path, change: dict) -> str:
     return "\n".join(lines)
 
 
-def configure(graph_path: Path, change: dict) -> str:
+def configure(graph_path: Path, change: dict, quote: str) -> str:
+    """Lock in a settings change that the user asked for, with their words, between stages."""
+    if not quote.strip():
+        raise SystemExit("refused: --quote must hold the user's own words asking for this change. Only the user "
+                         "changes a setting, at any autonomy level.")
     with locked(graph_path):
         data = load(graph_path)
         busy = in_flight(data, graph_path)
@@ -1697,7 +1719,7 @@ def configure(graph_path: Path, change: dict) -> str:
         if plan.get("changes") is None:
             plan["changes"] = []
         for k, v in change.items():
-            plan["changes"].append(f"{now()} {k}: {before[k]} -> {v}")
+            plan["changes"].append(f"{now()} {k}: {before[k]} -> {v} (the user: {quote.strip()!r})")
         save(graph_path, data)
     return "locked in: " + ", ".join(f"{k}={v}" for k, v in change.items())
 
@@ -1842,6 +1864,8 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("graph", type=Path)
         p.add_argument("settings", nargs="+")
+        if name == "configure":
+            p.add_argument("--quote", required=True, help="the user's own words asking for the change")
     p = sub.add_parser("approve")
     p.add_argument("graph", type=Path)
     p.add_argument("--autonomy", type=int, required=True)
@@ -1854,7 +1878,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.cmd == "configure":
-        print(configure(graph_path, parse_settings(args.settings)))
+        print(configure(graph_path, parse_settings(args.settings), args.quote))
         return 0
     if args.cmd == "approve":
         print(approve(graph_path, args.autonomy, args.quote))
@@ -1887,7 +1911,7 @@ def main(argv: list[str] | None = None) -> int:
         pairs = []
         for a in range(len(items)):
             for b in range(a + 1, len(items)):
-                shared = set(items[a].get("files") or []) & set(items[b].get("files") or [])
+                shared = scheduled_files(items[a], plan) & scheduled_files(items[b], plan)
                 if shared:
                     pairs.append(f"{items[a]['id']} x {items[b]['id']} ({len(shared)} shared)")
         if pairs:
@@ -1941,6 +1965,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {key} {value}: {minutes:.0f}{' *' if current else ''}")
         if not any(n.get("interface_deps") for n in todo):
             print("  (dependency_overlap interfaces changes nothing until tasks list interface_deps)")
+        listed = Counter(f for n in todo for f in scheduled_files(n, plan))
+        common = sorted(f for f, count in listed.items() if count >= 3 and count * 2 >= len(todo))
+        if common:
+            proposed = sorted(shared_files_of(plan) | set(common))
+            minutes = simulate(data, records, settings={"shared_files": proposed})[0]
+            print(f"shared files: {', '.join(f'{f} ({listed[f]} of {len(todo)} tasks)' for f in common)}. If the "
+                  f"tasks only add to them, as with docs or a changelog, list them in plan.shared_files so they "
+                  f"don't hold lanes back; a conflict in them goes through the resolve stage. Estimated with "
+                  f"shared_files {', '.join(proposed)}: {minutes:.0f} min")
         if len(todo) >= 3 and peak <= 1:
             if by_deps <= 1:
                 print("warning: the plan runs one lane at a time because the dependencies form a chain: each task "

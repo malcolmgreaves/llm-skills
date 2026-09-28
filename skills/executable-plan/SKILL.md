@@ -73,7 +73,8 @@ A worktree doesn't isolate everything, and the skill covers the rest:
 
 - **Merges.** Two lanes that change the same file work in peace and
   conflict when they land. `files` controls that: `next` opens at most
-  `file_overlap` lanes that list the same file or have already changed it.
+  `file_overlap` lanes that list the same file or have already changed it,
+  except for the files in `shared_files`.
   When a landing's rebase conflicts, the lane becomes `conflicted` and a
   resolve stage rebases it and keeps both sides.
 - **Shared git state.** The stash, refs, and config are shared by every
@@ -99,7 +100,7 @@ read its guideline files first.
 | Where worktrees and scratch go, the lane cap, the branch prefix | `worktree_root`, `scratch_root`, `lane_cap`, `branch_prefix` | Put both roots next to the repository (`../<repo>-lanes/…`), or under `$TMPDIR` in a sandbox. The machine sets the cap. |
 | The workflow for each size, and whether M and L end with a fix stage | `workflow` | Most of the cost. Show the defaults (`references/workflows.md`). |
 | The model and effort for each stage | `models`, `effort` | The user's choice, always; nothing in the skill picks a model. Include `resolve` and `resolution_review` when overlap is on; recommend a mid-tier model for both. |
-| How much lanes may overlap | `file_overlap`, `dependency_overlap` | Defaults: `file_overlap: 2`, `dependency_overlap: off`. Always explain every option (below). |
+| How much lanes may overlap | `file_overlap`, `dependency_overlap`, `shared_files` | Defaults: `file_overlap: 2`, `dependency_overlap: off`, no shared files. Always explain every option (below). |
 | The coordinator mode | `coordinator` | `full` (default), `merge`, or `delegate`: how much the coordinator reviews (`references/coordinator.md`). |
 | Autonomy (0 to 4; recommend 2) | `autonomy` | When the coordinator stops for the user (table under Mode 2). The user names the level; never pick 4 for them. |
 | Keep or squash lane commits | `commit_policy` | Keeping them keeps each stage's commit in the history. |
@@ -154,6 +155,14 @@ including none, with its estimate from `waves`:
   lands after its dependencies; if a dependency lands with a different
   interface than its spec said, the lane pays for a resolve stage, or for a
   fix and a review when the difference is large.
+- `shared_files` (default none): files that any number of open lanes can
+  change at once, whatever `file_overlap` is. Use it for a file that most
+  tasks only add to, such as `README.md` or a changelog: listed in every
+  task's `files`, it would otherwise let only `file_overlap` lanes run at a
+  time. A conflict in a shared file still goes through the resolve stage.
+  `waves` names the files that most tasks list and estimates the time with
+  them shared. The other way out is a final task that writes the docs for
+  all the others.
 
 Show the user, in one message: the plan, the `waves` output, the workflow for
 each size with its models and effort, the overlap settings with every option
@@ -184,7 +193,7 @@ Derive the edges honestly:
   correctness: `soft_deps`. The task doesn't start while one is running or
   starting, but it doesn't wait for one that can't start yet.
 - **Expected files** are a scheduling hint, not a fence: at most
-  `file_overlap` open lanes list the same file. Agents may change any file
+  `file_overlap` open lanes list the same file, apart from `shared_files`. Agents may change any file
   the work needs and report the unexpected ones.
 - An **interface dependency** is a hard dependency whose specification fixes
   the interface the task uses (a function signature, an output format): list
@@ -299,12 +308,16 @@ stage's model, effort, and duration, every owner-level decision taken, the
   Running lanes finish against their original spec; a new workflow, model,
   or coordinator mode applies to tasks that haven't started.
 - **The user changes a setting mid-run** (`file_overlap`,
-  `dependency_overlap`, `lane_cap`, `coordinator`, `autonomy`). Show them `plan.py
-  preview graph.yaml <key>=<value> ...`, which compares the current and the
-  proposed schedule, time, and workflows. After they approve, stop launching
-  stages, wait for the stages in flight to return (the barrier), and run
-  `plan.py configure graph.yaml <key>=<value> ...`, which refuses while any
-  stage is in flight and records the change in the plan. Then resume.
+  `dependency_overlap`, `shared_files`, `lane_cap`, `coordinator`,
+  `autonomy`). Only the user changes a setting, at any autonomy level. If a
+  setting slows the run, show the user `plan.py preview` and ask; don't
+  change it yourself. Show them `plan.py preview graph.yaml <key>=<value>
+  ...`, which compares the current and the proposed schedule, time, and
+  workflows. After they approve, stop launching stages, wait for the stages
+  in flight to return (the barrier), and run `plan.py configure graph.yaml
+  <key>=<value> ... --quote "<the user's words>"`, which refuses while any
+  stage is in flight or without the user's words, and records both in the
+  plan. Then resume.
 - **A resumed session.** Start with `plan.py render graph.yaml`, then follow
   the resume table in `references/coordinator.md`. Every status, stage
   start, and report is on disk.

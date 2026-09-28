@@ -36,7 +36,8 @@ nodes:     # the tasks (a list)
 | `coordinator` | `full`, `merge`, `delegate` | no | How much the coordinator reviews (`references/coordinator.md`). Default `full`. `delegate` adds a `delegate` stage to every workflow. |
 | `file_overlap` | integer ≥ 0 or `off` | no | The most open lanes that can list or change one file. Default `2`. `off` or `0` never opens two lanes on one file. With 2 or more, a landing can conflict and run the resolve stages. |
 | `dependency_overlap` | `off`, `interfaces`, `all` | no | Default `off`: a task starts after its dependencies land. `interfaces`: a task can start once a dependency in its `interface_deps` has started. `all`: once any dependency has started. A task always lands after its dependencies. |
-| `changes` | list of strings | runtime | `plan.py configure` appends one timestamped line per setting it changes. |
+| `shared_files` | list of paths | no | Files that any number of open lanes can list or change at once, whatever `file_overlap` is: files that most tasks only add to, such as `README.md`. A conflict in one goes through the resolve stage, so `models.resolve` and `models.resolution_review` are required when the list isn't empty. |
+| `changes` | list of strings | runtime | `plan.py configure` appends one line for each setting it changes: a timestamp, the old and new values, and the user's words. |
 | `stage_minutes` | map | no | Model-neutral minutes per stage for an S task, used by `waves` until this repository has measured timings. Defaults: implement 3, review 3.5, second_review 3, fix 2.5, delegate 2.5. M doubles them, L quadruples them. |
 | `timings` | path | no | Where measured stage timings are kept. Default: `executable-plan/timings.jsonl` in the repository's git directory, shared by every worktree and every plan in the repository. |
 | `commands` | map | no | `build`, `test`, `lint`, `check`, `run`: the project's commands, named in the lane prompts. |

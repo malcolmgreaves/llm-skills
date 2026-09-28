@@ -15,6 +15,7 @@ plan:
   coordinator: full      # full | merge | delegate: how much the coordinator reviews
   file_overlap: 2        # the most open lanes that can share one file; off (or 0) never shares
   dependency_overlap: off   # off | interfaces | all: may a task start before its dependencies land?
+  shared_files: []       # files most tasks only add to (README.md, a changelog): they never hold a lane back
   workflow:              # the user picks these at draft time
     S: [implement, review]
     M: [implement, review, second_review]
@@ -23,7 +24,7 @@ plan:
     implement: <model id>
     review: <model id>
     second_review: <model id>
-    resolve: <model id, mid-tier>              # needed when file_overlap > 1 or dependency_overlap is on
+    resolve: <model id, mid-tier>              # needed when file_overlap > 1, dependency_overlap is on, or shared_files is set
     resolution_review: <model id, mid-tier>
     # fix: <model id>
     # delegate: <model id>

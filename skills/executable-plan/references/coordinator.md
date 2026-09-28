@@ -205,9 +205,11 @@ the rebase changed behavior: reopen the lane (`references/workflows.md`,
 
 ## Changing a setting during the run
 
-The user can change `file_overlap`, `dependency_overlap`, `lane_cap`,
-`coordinator`, or `autonomy` at any time. Only the user asks for a change;
-raising autonomy, in particular, needs their explicit request. A change alters which lanes open and which stages
+The user can change `file_overlap`, `dependency_overlap`, `shared_files`,
+`lane_cap`, `coordinator`, or `autonomy` at any time. Only the user asks for
+a change, at every autonomy level; autonomy 4 lets the workflow make
+owner-level calls about the code, not about the plan's settings. If a
+setting slows the run, preview a better one and ask the user. A change alters which lanes open and which stages
 run, so it goes through a preview and a barrier:
 
 1. Run `plan.py preview graph.yaml <key>=<value> ...` and show the user its
@@ -216,10 +218,11 @@ run, so it goes through a preview and a barrier:
    happens when a landing conflicts.
 2. After the user approves, you are the barrier: stop launching stages and
    opening lanes, and wait until every stage in flight returns.
-3. Run `plan.py configure graph.yaml <key>=<value> ...`. It refuses while any
-   stage has started without a report, refuses a change that leaves errors
-   in the plan (for example overlap without `models.resolve`), and records
-   the change with a timestamp in `plan.changes`.
+3. Run `plan.py configure graph.yaml <key>=<value> ... --quote "<the user's
+   words>"`. It refuses without the user's words, refuses while any stage
+   has started without a report, refuses a change that leaves errors in the
+   plan (for example overlap without `models.resolve`), and records the
+   change with a timestamp and the user's words in `plan.changes`.
 4. Resume. Open lanes keep running; the new settings decide which lanes
    open from now on. Every landing still waits for its dependencies, and a
    conflicted landing still goes through the resolve stage, whatever the
@@ -229,7 +232,8 @@ run, so it goes through a preview and a barrier:
 
 - **The worktree isolates a lane while it works, not when it lands.** Two
   lanes that change the same file conflict at the rebase. `next` opens at
-  most `file_overlap` lanes that list a file or have already changed it;
+  most `file_overlap` lanes that list a file or have already changed it
+  (any number for a file in `shared_files`);
   with `file_overlap: off`, never two. A conflict that happens anyway goes
   through the resolve stage.
 - Agents may change any file the work needs. They report every file outside
