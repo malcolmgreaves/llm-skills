@@ -32,3 +32,6 @@ target
 
 # claude plugin eval output
 **/evals/results/
+
+# Tools environment for an eval run; evals/run.sh deletes it on exit
+.eval-tools/

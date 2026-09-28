@@ -50,6 +50,15 @@ XML_TAG = re.compile(r"<[a-zA-Z/][^>]*>")
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n?(.*)\Z", re.DOTALL)
 MD_LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 
+# Code in a skill's Markdown is not prose. `def f[T](x: T)` is valid Python
+# and also matches MD_LINK, so the prose checks run on the text with the code
+# removed, and the code goes to check_code instead.
+FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
+# An inline code span opens with a run of backticks and closes with the next
+# run of the same length. It can wrap onto the next line but can't cross a
+# blank line, which ends the paragraph.
+INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)((?:(?!\n[ \t]*\n).)+?)(?<!`)\1(?!`)", re.DOTALL)
+
 # Soft limits from the progressive-disclosure guidance: SKILL.md is loaded whole
 # the moment the skill triggers, so length there is a recurring context cost.
 BODY_LINE_WARN = 500
@@ -58,8 +67,12 @@ REFERENCE_LINE_WARN = 300
 # Skills are self-contained, so a family of related skills duplicates the text
 # it shares. Each copy is wrapped in a marker pair with the same key, and every
 # copy of a key must be identical, so the duplicates cannot drift apart.
-SHARED_OPEN = re.compile(r"<!-- shared: ([a-z0-9][a-z0-9/_.-]*) -->")
-SHARED_CLOSE = "<!-- /shared -->"
+# Markdown marks a block with HTML comments. A shell script, in which an HTML
+# comment is not a comment, marks it with `#` comments.
+SHARED_MARKERS: dict[str, tuple[re.Pattern[str], str]] = {
+    ".md": (re.compile(r"<!-- shared: ([a-z0-9][a-z0-9/_.-]*) -->"), "<!-- /shared -->"),
+    ".sh": (re.compile(r"# shared: ([a-z0-9][a-z0-9/_.-]*)"), "# /shared"),
+}
 SHARED_DIFF_LINES = 20
 
 
@@ -81,6 +94,89 @@ class Report:
     @property
     def ok(self) -> bool:
         return not self.errors and not self.warnings
+
+
+@dataclass(frozen=True)
+class Code:
+    """A fenced code block or an inline code span in a Markdown file."""
+
+    path: Path
+    line: int  # line in `path` where the code starts, counting from 1
+    text: str  # the code without its fence or backticks
+    language: str  # first word of the fence's info string; "" if none or inline
+    inline: bool
+
+
+def blank(text: str) -> str:
+    """Replaces every character except line breaks with a space."""
+    return re.sub(r"[^\n]", " ", text)
+
+
+def split_code(markdown: str, path: Path, first_line: int = 1) -> tuple[str, list[Code]]:
+    """Separates Markdown into prose and code.
+
+    Returns the text with each fenced code block and inline code span blanked
+    out, so line numbers still match, and the code that was removed. An
+    unclosed fence runs to the end of the text, as in CommonMark.
+    `first_line` is the line of `path` on which `markdown` starts.
+    """
+    lines = markdown.splitlines(keepends=True)
+    prose: list[str] = []
+    code: list[Code] = []
+    index = 0
+    while index < len(lines):
+        opened = FENCE_OPEN.fullmatch(lines[index].rstrip("\n"))
+        # A backtick fence's info string can't contain a backtick; a line
+        # like "```a``` b" is an inline span, not a fence.
+        if opened is None or (opened.group(1)[0] == "`" and "`" in opened.group(2)):
+            prose.append(lines[index])
+            index += 1
+            continue
+        fence, info = opened.groups()
+        closing = re.compile(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*")
+        end = index + 1
+        while end < len(lines) and not closing.fullmatch(lines[end].rstrip("\n")):
+            end += 1
+        info_words = info.split()
+        code.append(
+            Code(
+                path=path,
+                line=first_line + index + 1,
+                text="".join(lines[index + 1 : end]),
+                language=info_words[0] if info_words else "",
+                inline=False,
+            )
+        )
+        block_end = min(end + 1, len(lines))
+        prose.extend(blank(line) for line in lines[index:block_end])
+        index = block_end
+
+    without_fences = "".join(prose)
+
+    def remove_span(span: re.Match[str]) -> str:
+        code.append(
+            Code(
+                path=path,
+                line=first_line + without_fences.count("\n", 0, span.start()),
+                text=span.group(2),
+                language="",
+                inline=True,
+            )
+        )
+        return blank(span.group(0))
+
+    without_code = INLINE_CODE.sub(remove_span, without_fences)
+    code.sort(key=lambda c: c.line)
+    return without_code, code
+
+
+def check_code(code: list[Code], report: Report) -> None:
+    """Checks the code in a skill's Markdown. It checks nothing yet.
+
+    validate_skill passes every fenced code block and inline code span from
+    SKILL.md and references/*.md to this function. A check on code, such as
+    parsing each `python` block, goes here and reports through `report`.
+    """
 
 
 def check_name(name: object, directory: Path, report: Report) -> None:
@@ -244,7 +340,12 @@ def validate_skill(directory: Path) -> Report:
             "move detail into references/ and point at it conditionally"
         )
 
-    check_links(body, directory, report)
+    body_line = raw[: match.start(2)].count("\n") + 1
+    prose, code = split_code(body, skill_file, first_line=body_line)
+    check_links(prose, directory, report)
+    for reference in sorted(directory.glob("references/*.md")):
+        code.extend(split_code(reference.read_text(encoding="utf-8"), reference)[1])
+    check_code(code, report)
     check_bundled_files(directory, report)
 
     # Repo convention, not spec: every skill ships human-facing docs alongside.
@@ -311,22 +412,26 @@ def validate_marketplace(skill_dirs: list[Path]) -> Report:
 def validate_shared_blocks(skill_dirs: list[Path]) -> Report:
     """Every copy of a shared block must match the others byte for byte.
 
-    A block is the lines between `<!-- shared: KEY -->` and `<!-- /shared -->`,
-    each on a line of its own, in any Markdown file under a skill directory."""
+    A block is the lines between `<!-- shared: KEY -->` and `<!-- /shared -->`
+    in a Markdown file, or between `# shared: KEY` and `# /shared` in a shell
+    script, each marker on a line of its own, in any file under a skill
+    directory."""
     report = Report(path=REPO_ROOT / "skills", label="shared blocks")
     copies: dict[str, list[tuple[Path, str]]] = defaultdict(list)
 
     for directory in skill_dirs:
-        for path in sorted(directory.rglob("*.md")):
+        paths = (p for p in directory.rglob("*") if p.suffix in SHARED_MARKERS and p.is_file())
+        for path in sorted(paths):
             relative = path.relative_to(REPO_ROOT)
             if "results" in path.relative_to(directory).parts:
                 continue  # eval output, not authored content
+            shared_open, shared_close = SHARED_MARKERS[path.suffix]
             key: str | None = None
             start = 0
             seen: set[str] = set()
             lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
             for number, line in enumerate(lines, start=1):
-                opened = SHARED_OPEN.fullmatch(line.strip())
+                opened = shared_open.fullmatch(line.strip())
                 if opened:
                     if key is not None:
                         report.error(
@@ -338,9 +443,9 @@ def validate_shared_blocks(skill_dirs: list[Path]) -> Report:
                     if key in seen:
                         report.error(f"{relative}:{number}: shared block `{key}` appears twice")
                     seen.add(key)
-                elif line.strip() == SHARED_CLOSE:
+                elif line.strip() == shared_close:
                     if key is None:
-                        report.error(f"{relative}:{number}: `{SHARED_CLOSE}` has no opening marker")
+                        report.error(f"{relative}:{number}: `{shared_close}` has no opening marker")
                         continue
                     copies[key].append((relative, "".join(lines[start : number - 1])))
                     key = None

@@ -60,6 +60,20 @@
       "repository": "https://github.com/malcolmgreaves/llm-skills",
       "license": "MPL-2.0",
       "keywords": ["asimov", "robotics", "ethics", "safety"]
+    },
+    {
+      "name": "typed-python",
+      "source": "./",
+      "strict": false,
+      "skills": ["./skills/typed-python"],
+      "description": "Makes the agent write fully type-annotated Python with precise types, compose it from small pure functions, and cover it with table tests.",
+      "author": {
+        "name": "Malcolm Greaves"
+      },
+      "homepage": "https://github.com/malcolmgreaves/llm-skills/tree/main/skills/typed-python",
+      "repository": "https://github.com/malcolmgreaves/llm-skills",
+      "license": "MPL-2.0",
+      "keywords": ["python", "typing", "mypy", "testing"]
     }
   ]
 }

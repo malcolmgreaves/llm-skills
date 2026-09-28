@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: slugify-table-tests
+context:
+  scaffold_script: fixture.sh

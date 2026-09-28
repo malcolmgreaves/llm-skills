@@ -160,6 +160,12 @@ Errors are spec violations and broken links; warnings are conventions from this
 file. It exits non-zero on any error. Run it before every commit that touches a
 skill.
 
+The link check skips fenced code blocks and inline code spans, so code such as
+`def f[T](x: T)` is not read as a Markdown link. The validator passes that code,
+from `SKILL.md` and `references/*.md`, to `check_code()`, which checks nothing
+yet. Add checks on code there. Run the validator's tests with
+`uv run scripts/test_validate.py`.
+
 ## Shared content between skills
 
 Every skill is self-contained, so a family of related skills (for example
@@ -172,10 +178,20 @@ Wrap each duplicated passage in a marker pair, each marker on a line of its own:
 <!-- /shared -->
 ```
 
+In a shell script, such as an eval case's `fixture.sh`, the markers are shell
+comments, each on a line of its own:
+
+```bash
+# shared: family/topic
+...identical commands...
+# /shared
+```
+
 A whole file can be one block. When run on the whole repo, `validate.py` finds
-every block in every Markdown file under `skills/`. It fails when two copies
-of a key differ (and prints the diff) or when a marker is unbalanced. It warns
-when a key has only one copy. Edit one copy, then copy it to the others.
+every block in every Markdown file and shell script under `skills/`. It fails
+when two copies of a key differ (and prints the diff) or when a marker is
+unbalanced. It warns when a key has only one copy. Edit one copy, then copy it
+to the others.
 
 ## Testing a skill
 
