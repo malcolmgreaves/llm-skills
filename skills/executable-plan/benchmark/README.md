@@ -1,9 +1,9 @@
 # The cells benchmark
 
 This benchmark compares the executable-plan skill with a plain agent on one
-backlog, under the same time limit. Every arm starts from the same small
-spreadsheet engine, `cells`, and implements the same ten tasks. Hidden tests
-score whatever is in each arm's checkout when its time runs out.
+backlog. Every arm starts from the same small spreadsheet engine, `cells`,
+and implements the same ten tasks. Hidden tests score whatever is in each
+arm's checkout when the arm finishes, or when the cap stops it.
 
 `claude plugin eval` can't run this benchmark: it has no grader that runs
 code, it runs two arms for each case, and its sandbox blocks the directory next to
@@ -17,7 +17,7 @@ cd skills/executable-plan/benchmark
 python3 run.py --out /tmp/cells-run-1
 ```
 
-The runner starts all five arms together, stops them all at once after 30
+The runner starts all five arms together, stops them all at once after 60
 minutes at most, and then runs `score.py`, which writes `report.md` and
 `scores.json` in the output directory. `--out` must be a new directory
 outside this repository, so that the hidden tests and the reference
@@ -43,16 +43,23 @@ arm's project settings, every plugin that `~/.claude/settings.json` enables.
 The report's Environment table shows the plugins that each arm loaded and
 the commands that hooks refused.
 
-The "with" arms might not finish all ten tasks in 30 minutes. With this
-backlog, the skill's own `plan.py waves` estimates 21 to 32 minutes of
-execution if every task is sized S, before the draft and any conflict, and
-more if tasks are sized M. The per-task scores and the progress table count
-partial work, so a run still shows how far each arm got.
+The prompt names no deadline, and the cap is only where scoring happens.
+In the first run, the prompt named a 30-minute deadline, and every "with" arm
+dropped the skill's process to beat it: two implemented the tasks alone, and
+one skipped every review. That run measured plain agents three times. The
+progress table still shows every arm at 30 minutes, from the snapshots.
 
-A full run takes about 30 minutes for the arms and 5 to 15 minutes of
-scoring. Based on earlier tests, it costs about $70-110: about $20-30 for
-each "with" arm and $5-10 for each "without" arm. Each arm stops at
-`--budget-usd` (default $40).
+With this backlog, the skill's own `plan.py waves` estimates 21 to 32
+minutes of execution if every task is sized S and `README.md` is a shared
+file, before the draft and any conflict, and more if tasks are sized M. The
+per-task scores and the progress table count partial work, so a run shows
+how far each arm got by the cap.
+
+A full run takes up to 60 minutes for the arms and 5 to 15 minutes of
+scoring. The plain arms cost about $3 each in the first run. A "with" arm
+that runs the whole process costs more: the first run's one arm that used
+subagents cost $22 without any review stages. Each arm stops at
+`--budget-usd` (default $60).
 
 ## The arms
 
@@ -66,8 +73,8 @@ each "with" arm and $5-10 for each "without" arm. Each arm stops at
 
 Every arm runs on Sonnet at effort `medium`, with the same budget cap, the same
 tools apart from subagents, and the same prompt apart from one block. The
-shared prompt names the deadline, to the second, and says that only the
-checkout's files count. It also says the user isn't available, and asks the
+shared prompt says that hidden tests score the checkout's files when the
+agent finishes, and that only those files count. It names no deadline. It also says the user isn't available, and asks the
 agent to list its decisions and open questions at the end. `without-free`
 adds a block that allows subagents: Sonnet to implement, Opus to review. The
 "with" arms add a block with the draft settings (Sonnet implements, Opus

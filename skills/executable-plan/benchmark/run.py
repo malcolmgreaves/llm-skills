@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Runs the cells benchmark: every arm in parallel, each for at most --cap-minutes, then scores them.
 
-    python3 run.py --out DIR                      # all five arms, 30 minutes, then score
+    python3 run.py --out DIR                      # all five arms, 60 minutes at most, then score
     python3 run.py --out DIR --arms with-default  # a subset
     python3 run.py --out DIR --dry-run            # set up the arms and print their prompts
 
@@ -12,6 +12,11 @@ checkout to DIR/<arm>/snapshots/tNN; when an arm ends, or the cap stops it, the 
 copies it to DIR/<arm>/snapshots/final. score.py then runs the hidden tests on every
 snapshot. DIR must not exist, and must be outside this repository, so that the hidden
 tests and the reference implementation aren't in any arm's directories.
+
+The prompt names no deadline. In the first run, the prompt named one, and every "with"
+arm dropped the skill's process to beat it, so that run measured three plain agents.
+Without a deadline, each arm works at its own pace; the cap is only where scoring
+happens, and the snapshots show every arm at every 5 minutes.
 """
 
 import argparse
@@ -23,7 +28,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -37,9 +42,8 @@ BASE_PROMPT = """\
 Implement every task in BACKLOG.md in this repository. README.md describes the \
 existing behavior, which must keep working, and CLAUDE.md gives the project's rules.
 
-Hidden acceptance tests score this checkout, the files in this directory on the \
-`main` branch, at {deadline} UTC: {cap} minutes after you start. Work that isn't in \
-this directory's files by then doesn't count. Run `date -u` to see the time.
+When you finish, hidden acceptance tests score the files in this directory, the \
+checkout of the `main` branch. Work that isn't in this directory's files doesn't count.
 
 I won't be available to answer questions. Make reasonable decisions and keep going. \
 In your final message, list every decision you made where the backlog or the README \
@@ -123,9 +127,8 @@ def prepare(root: Path, arm: Arm, disable_plugins: list[str]) -> Path:
     return repo
 
 
-def prompt_for(arm: Arm, deadline: datetime, cap: int) -> str:
-    text = BASE_PROMPT.format(deadline=deadline.strftime("%H:%M:%S"), cap=cap)
-    return f"{text}\n\n{arm.block}" if arm.block else text
+def prompt_for(arm: Arm) -> str:
+    return f"{BASE_PROMPT}\n\n{arm.block}" if arm.block else BASE_PROMPT
 
 
 def command(claude: str, prompt: str, arm: Arm, root: Path, budget: float) -> list[str]:
@@ -185,8 +188,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, required=True, help="a new directory outside this repository")
     parser.add_argument("--arms", default=",".join(ARMS), help="comma-separated arm names")
-    parser.add_argument("--cap-minutes", type=int, default=30)
-    parser.add_argument("--budget-usd", type=float, default=40.0, help="--max-budget-usd for each arm")
+    parser.add_argument("--cap-minutes", type=int, default=60)
+    parser.add_argument("--budget-usd", type=float, default=60.0, help="--max-budget-usd for each arm")
     parser.add_argument("--claude", default="claude", help="the claude executable")
     parser.add_argument("--disable-user-plugins", action="store_true",
                         help="turn off, in each arm's project settings, the plugins that ~/.claude/settings.json enables")
@@ -216,11 +219,9 @@ def main(argv: list[str] | None = None) -> int:
         root.mkdir()
         runs[name] = {"root": root, "arm": ARMS[name],
                       "repo": prepare(root, ARMS[name], plugins if args.disable_user_plugins else [])}
-    # The deadline in the prompt is the moment the runner stops the arms.
     start = datetime.now(timezone.utc)
-    deadline = start + timedelta(minutes=args.cap_minutes)
     for name, run in runs.items():
-        run["prompt"] = prompt_for(run["arm"], deadline, args.cap_minutes)
+        run["prompt"] = prompt_for(run["arm"])
         (run["root"] / "prompt.txt").write_text(run["prompt"] + "\n")
         print(f"== {name}\n{run['prompt']}\n")
     (out / "run.json").write_text(json.dumps({
