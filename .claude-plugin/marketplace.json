@@ -34,6 +34,20 @@
       "keywords": ["writing", "style-guide", "documentation"]
     },
     {
+      "name": "asd-ste100-simplified-technical-english",
+      "source": "./",
+      "strict": false,
+      "skills": ["./skills/asd-ste100-simplified-technical-english"],
+      "description": "Writes all prose (replies, commit messages, comments, docstrings, and docs) in ASD-STE100 Simplified Technical English.",
+      "author": {
+        "name": "Malcolm Greaves"
+      },
+      "homepage": "https://github.com/malcolmgreaves/llm-skills/tree/main/skills/asd-ste100-simplified-technical-english",
+      "repository": "https://github.com/malcolmgreaves/llm-skills",
+      "license": "MPL-2.0",
+      "keywords": ["writing", "style-guide", "controlled-language", "documentation"]
+    },
+    {
       "name": "asimov-three-laws",
       "source": "./",
       "strict": false,
