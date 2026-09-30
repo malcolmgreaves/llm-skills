@@ -88,6 +88,20 @@
       "repository": "https://github.com/malcolmgreaves/llm-skills",
       "license": "MPL-2.0",
       "keywords": ["python", "typing", "mypy", "testing"]
+    },
+    {
+      "name": "robust-rust",
+      "source": "./",
+      "strict": false,
+      "skills": ["./skills/robust-rust"],
+      "description": "Writes type-driven, functional Rust: types first, enums and typestate for states, traits as ML-style modules, and GATs where types borrow.",
+      "author": {
+        "name": "Malcolm Greaves"
+      },
+      "homepage": "https://github.com/malcolmgreaves/llm-skills/tree/main/skills/robust-rust",
+      "repository": "https://github.com/malcolmgreaves/llm-skills",
+      "license": "MPL-2.0",
+      "keywords": ["rust", "types", "typestate", "functional-programming"]
     }
   ]
 }
